@@ -2,6 +2,13 @@
 #
 # Licensed under the NVIDIA Source Code License [see LICENSE for details].
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import warp as wp
+
 from collections import OrderedDict
 
 import numpy as np
@@ -164,6 +171,8 @@ class Threading(SingleArmEnv_MG):
         camera_segmentations=None,  # {None, instance, class, element}
         renderer="mujoco",
         renderer_config=None,
+        use_warp: bool = False,
+        num_envs: int = 1,
     ):
         # settings for table top
         self.table_full_size = table_full_size
@@ -202,9 +211,11 @@ class Threading(SingleArmEnv_MG):
             camera_segmentations=camera_segmentations,
             renderer=renderer,
             renderer_config=renderer_config,
+            use_warp=use_warp,
+            num_envs=num_envs,
         )
 
-    def reward(self, action=None):
+    def reward(self, action: np.ndarray | wp.array | None = None) -> float:
         """
         Reward function for the task.
 
@@ -362,7 +373,19 @@ class Threading(SingleArmEnv_MG):
 
             # Loop through all objects and reset their positions
             for obj_pos, obj_quat, obj in object_placements.values():
-                self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+                if self.use_warp:
+                    import warp as wp
+                    from robosuite.utils.binding_utils import MjSimWarp
+                    assert isinstance(self.sim, MjSimWarp)
+                    _val = np.array([*obj_pos, *obj_quat], dtype=np.float32)
+                    self.sim.data.set_joint_qpos(
+                        obj.joints[0],
+                        wp.from_numpy(np.tile(_val, (self.num_envs, 1)), device=self.sim._warp_data.qpos.device),
+                    )
+                else:
+                    from robosuite.utils.binding_utils import MjSimWarp
+                    assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
+                    self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
     def _setup_observables(self):
         """

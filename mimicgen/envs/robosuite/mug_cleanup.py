@@ -2,6 +2,13 @@
 #
 # Licensed under the NVIDIA Source Code License [see LICENSE for details].
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import warp as wp
+
 """
 Simpler object cleanup task (inspired by BUDS Hammer Place, see https://github.com/ARISE-Initiative/robosuite-task-zoo) 
 where a single object needs to be packed away into a drawer. The default task is to cleanup a 
@@ -176,6 +183,8 @@ class MugCleanup(SingleArmEnv_MG):
         renderer_config=None,
         shapenet_id="3143a4ac",
         shapenet_scale=0.8,
+        use_warp: bool = False,
+        num_envs: int = 1,
     ):
         # shapenet mug to use
         self._shapenet_id = shapenet_id
@@ -218,9 +227,11 @@ class MugCleanup(SingleArmEnv_MG):
             camera_segmentations=camera_segmentations,
             renderer=renderer,
             renderer_config=renderer_config,
+            use_warp=use_warp,
+            num_envs=num_envs,
         )
 
-    def reward(self, action=None):
+    def reward(self, action: np.ndarray | wp.array | None = None) -> float:
         """
         Reward function for the task.
 
@@ -469,7 +480,19 @@ class MugCleanup(SingleArmEnv_MG):
                     self.sim.model.body_quat[body_id] = obj_quat
                 else:
                     # object has free joint - use it to set pose
-                    self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+                    if self.use_warp:
+                        import warp as wp
+                        from robosuite.utils.binding_utils import MjSimWarp
+                        assert isinstance(self.sim, MjSimWarp)
+                        _val = np.array([*obj_pos, *obj_quat], dtype=np.float32)
+                        self.sim.data.set_joint_qpos(
+                            obj.joints[0],
+                            wp.from_numpy(np.tile(_val, (self.num_envs, 1)), device=self.sim._warp_data.qpos.device),
+                        )
+                    else:
+                        from robosuite.utils.binding_utils import MjSimWarp
+                        assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
+                        self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
         # Drawer should start closed (0.) but can set to open (-0.135) for debugging.
         self.sim.data.qpos[self.drawer_qpos_addr] = 0.

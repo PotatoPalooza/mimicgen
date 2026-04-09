@@ -2,6 +2,13 @@
 #
 # Licensed under the NVIDIA Source Code License [see LICENSE for details].
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import warp as wp
+
 """
 Contains environments for BUDS hammer place task from robosuite task zoo repo.
 (https://github.com/ARISE-Initiative/robosuite-task-zoo)
@@ -470,7 +477,19 @@ class HammerCleanup_D1(HammerCleanup_D0):
                     self.sim.model.body_quat[body_id] = obj_quat
                 else:
                     # object has free joint - use it to set pose
-                    self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+                    if self.use_warp:
+                        import warp as wp
+                        from robosuite.utils.binding_utils import MjSimWarp
+                        assert isinstance(self.sim, MjSimWarp)
+                        _val = np.array([*obj_pos, *obj_quat], dtype=np.float32)
+                        self.sim.data.set_joint_qpos(
+                            obj.joints[0],
+                            wp.from_numpy(np.tile(_val, (self.num_envs, 1)), device=self.sim._warp_data.qpos.device),
+                        )
+                    else:
+                        from robosuite.utils.binding_utils import MjSimWarp
+                        assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
+                        self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
         self.ee_force_bias = np.zeros(3)
         self.ee_torque_bias = np.zeros(3)
