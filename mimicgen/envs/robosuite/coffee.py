@@ -10,21 +10,27 @@ if TYPE_CHECKING:
     import warp as wp
 
 import os
-from robosuite.utils.binding_utils import MjSimWarp
 from copy import deepcopy
 
 import numpy as np
-import torch
 import robosuite.utils.transform_utils as T
+import torch
 from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
 from robosuite.models.arenas import TableArena
 from robosuite.models.tasks import ManipulationTask
+from robosuite.utils.binding_utils import MjSimWarp
 from robosuite.utils.mjcf_utils import CustomMaterial, add_material, find_elements, string_to_array
 from robosuite.utils.observables import Observable, sensor
 from robosuite.utils.placement_samplers import SequentialCompositeSampler, UniformRandomSampler
 
 import mimicgen
 from mimicgen.envs.robosuite.single_arm_env_mg import SingleArmEnv_MG
+from mimicgen.models.robosuite.objects import (
+    BlenderObject,
+    CoffeeMachineObject,
+    CoffeeMachinePodObject,
+    LongDrawerObject,
+)
 
 
 def _lnorm(x, dim=-1):
@@ -32,12 +38,6 @@ def _lnorm(x, dim=-1):
     if isinstance(x, torch.Tensor):
         return torch.linalg.norm(x, dim=dim)
     return np.linalg.norm(x, axis=dim)
-from mimicgen.models.robosuite.objects import (
-    BlenderObject,
-    CoffeeMachineObject,
-    CoffeeMachinePodObject,
-    LongDrawerObject,
-)
 
 
 class Coffee(SingleArmEnv_MG):
@@ -397,6 +397,7 @@ class Coffee(SingleArmEnv_MG):
             if self.use_warp:
                 import warp as wp
                 from robosuite.utils.binding_utils import MjSimWarp
+
                 assert isinstance(self.sim, MjSimWarp)
 
                 # Sample num_envs independent configurations so each parallel env
@@ -424,11 +425,13 @@ class Coffee(SingleArmEnv_MG):
                 # Loop through all objects and reset their positions
                 for obj_pos, obj_quat, obj in object_placements.values():
                     from robosuite.utils.binding_utils import MjSimWarp
+
                     assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
                     self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
         # Always reset the hinge joint position
         from robosuite.utils.binding_utils import MjSimWarp
+
         if isinstance(self.sim, MjSimWarp):
             self.sim.data.set_qpos_indexed([self.hinge_qpos_addr], np.array([2.0 * np.pi / 3.0]))
         else:
@@ -547,7 +550,7 @@ class Coffee(SingleArmEnv_MG):
             bid = self.obj_body_id[obj_name]
             if isinstance(self.sim, MjSimWarp):
                 q = self.sim.data.body_xquat[bid]  # (num_envs, 4) wxyz torch.Tensor
-                return q[:, [1, 2, 3, 0]]             # (num_envs, 4) xyzw torch.Tensor
+                return q[:, [1, 2, 3, 0]]  # (num_envs, 4) xyzw torch.Tensor
             return T.convert_quat(self.sim.data.body_xquat[bid], to="xyzw")
 
         @sensor(modality=modality)
@@ -558,11 +561,11 @@ class Coffee(SingleArmEnv_MG):
             ):
                 return np.zeros(3)
             if isinstance(self.sim, MjSimWarp):
-                obj_pos = obs_cache[f"{obj_name}_pos"]    # (num_envs, 3) tensor
+                obj_pos = obs_cache[f"{obj_name}_pos"]  # (num_envs, 3) tensor
                 obj_quat = obs_cache[f"{obj_name}_quat"]  # (num_envs, 4) tensor xyzw
                 world_poses = obs_cache["world_pose_in_gripper"]  # (num_envs, 4, 4) tensor
-                obj_pose = T.pose2mat_torch(obj_pos, obj_quat)    # (num_envs, 4, 4)
-                rel_pose = world_poses @ obj_pose                  # (num_envs, 4, 4)
+                obj_pose = T.pose2mat_torch(obj_pos, obj_quat)  # (num_envs, 4, 4)
+                rel_pose = world_poses @ obj_pose  # (num_envs, 4, 4)
                 obs_cache[f"{obj_name}_to_{pf}eef_quat"] = T.mat2quat_torch(rel_pose[:, :3, :3])
                 obs_cache[f"{obj_name}_pose"] = obj_pose
                 return rel_pose[:, :3, 3]  # (num_envs, 3)
@@ -721,8 +724,8 @@ class Coffee(SingleArmEnv_MG):
 
     def _check_pod(self):
         pod_holder_pos = self._get_body_pos(self.obj_body_id["coffee_pod_holder"])  # (..., 3)
-        pod_pos = self._get_body_pos(self.obj_body_id["coffee_pod"])                # (..., 3)
-        lid_pos = self._get_body_pos(self.obj_body_id["coffee_machine_lid"])         # (..., 3)
+        pod_pos = self._get_body_pos(self.obj_body_id["coffee_pod"])  # (..., 3)
+        lid_pos = self._get_body_pos(self.obj_body_id["coffee_machine_lid"])  # (..., 3)
 
         r_diff = self.pod_holder_size[0] - self.pod_size[0]
         pod_horz_check = _lnorm(pod_pos[..., :2] - pod_holder_pos[..., :2]) <= r_diff
@@ -741,7 +744,7 @@ class Coffee(SingleArmEnv_MG):
         pod_check = self._check_pod()
 
         pod_holder_pos = self._get_body_pos(self.obj_body_id["coffee_pod_holder"])  # (..., 3)
-        pod_pos = self._get_body_pos(self.obj_body_id["coffee_pod"])                # (..., 3)
+        pod_pos = self._get_body_pos(self.obj_body_id["coffee_pod"])  # (..., 3)
 
         r_diff = self.pod_holder_size[0] - self.pod_size[0]
         pod_horz_check = _lnorm(pod_pos[..., :2] - pod_holder_pos[..., :2]) <= r_diff
@@ -1267,6 +1270,7 @@ class CoffeePreparation(Coffee):
             if self.use_warp:
                 import warp as wp
                 from robosuite.utils.binding_utils import MjSimWarp
+
                 assert isinstance(self.sim, MjSimWarp)
                 _val = np.array([*pod_pos, *pod_quat], dtype=np.float32)
                 self.sim.data.set_joint_qpos(
@@ -1275,6 +1279,7 @@ class CoffeePreparation(Coffee):
                 )
             else:
                 from robosuite.utils.binding_utils import MjSimWarp
+
                 assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
                 self.sim.data.set_joint_qpos(pod_obj.joints[0], np.concatenate([np.array(pod_pos), np.array(pod_quat)]))
 
