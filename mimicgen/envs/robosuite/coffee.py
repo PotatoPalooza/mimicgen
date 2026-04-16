@@ -189,6 +189,12 @@ class Coffee(SingleArmEnv_MG):
         renderer_config=None,
         use_warp: bool = False,
         num_envs: int = 1,
+        extra_randomization: bool = False,
+        placement_bounds_pad: float = 0.05,
+        full_rotation_randomization: bool = True,
+        tipover_prob: float = 0.0,
+        tipover_angle_range: tuple[float, float] = (np.pi / 3.0, np.pi / 2.0),
+        tipover_z_bump: float = 0.03,
     ):
         # settings for table top
         self.table_full_size = table_full_size
@@ -201,6 +207,14 @@ class Coffee(SingleArmEnv_MG):
 
         # whether to use ground-truth object states
         self.use_object_obs = use_object_obs
+
+        # extra reset randomization (widened bounds + optional tipover) for RL
+        self.extra_randomization = extra_randomization
+        self.placement_bounds_pad = placement_bounds_pad
+        self.full_rotation_randomization = full_rotation_randomization
+        self.tipover_prob = tipover_prob
+        self.tipover_angle_range = tipover_angle_range
+        self.tipover_z_bump = tipover_z_bump
 
         super().__init__(
             robots=robots,
@@ -324,8 +338,56 @@ class Coffee(SingleArmEnv_MG):
             ),
         )
 
+    def _padded_objects(self) -> tuple[str, ...]:
+        return ("coffee_pod", "coffee_machine")
+
+    def _full_rotation_objects(self) -> tuple[str, ...]:
+        return ("coffee_pod",)
+
+    def _tippable_objects(self) -> tuple[str, ...]:
+        return ("coffee_pod",)
+
+    def _maybe_apply_extra_randomization(self, bounds: dict[str, dict]) -> dict[str, dict]:
+        if not self.extra_randomization:
+            return bounds
+        pad = self.placement_bounds_pad
+        padded = set(self._padded_objects())
+        full_rot = set(self._full_rotation_objects()) if self.full_rotation_randomization else set()
+        out: dict[str, dict] = {}
+        for name, b in bounds.items():
+            nb = dict(b)
+            if name in padded:
+                nb["x"] = (b["x"][0] - pad, b["x"][1] + pad)
+                nb["y"] = (b["y"][0] - pad, b["y"][1] + pad)
+            if name in full_rot:
+                nb["z_rot"] = (-np.pi, np.pi)
+            out[name] = nb
+        return out
+
+    def _maybe_tip_placement(
+        self, obj, obj_pos: np.ndarray, obj_quat: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        # quats are (w, x, y, z) to match placement sampler + MuJoCo free-joint qpos order
+        if self.tipover_prob <= 0.0 or obj.name not in self._tippable_objects():
+            return obj_pos, obj_quat
+        if np.random.rand() >= self.tipover_prob:
+            return obj_pos, obj_quat
+
+        tip_angle = np.random.uniform(*self.tipover_angle_range)
+        axis_angle = np.random.uniform(0.0, 2.0 * np.pi)
+        axis = np.array([np.cos(axis_angle), np.sin(axis_angle), 0.0])
+        tip_xyzw = T.axisangle2quat(axis * tip_angle)
+
+        base_xyzw = T.convert_quat(np.asarray(obj_quat), to="xyzw")
+        new_xyzw = T.quat_multiply(tip_xyzw, base_xyzw)
+        new_wxyz = T.convert_quat(new_xyzw, to="wxyz")
+
+        new_pos = np.array(obj_pos, dtype=np.float64)
+        new_pos[2] += self.tipover_z_bump
+        return new_pos, new_wxyz
+
     def _get_placement_initializer(self):
-        bounds = self._get_initial_placement_bounds()
+        bounds = self._maybe_apply_extra_randomization(self._get_initial_placement_bounds())
 
         self.placement_initializer = SequentialCompositeSampler(name="ObjectSampler")
         self.placement_initializer.append_sampler(
@@ -407,6 +469,7 @@ class Coffee(SingleArmEnv_MG):
                 for _ in range(self.num_envs):
                     placements = self.placement_initializer.sample()
                     for obj_pos, obj_quat, obj in placements.values():
+                        obj_pos, obj_quat = self._maybe_tip_placement(obj, obj_pos, obj_quat)
                         key = obj.joints[0]
                         if key not in all_placements:
                             all_placements[key] = []
@@ -427,6 +490,7 @@ class Coffee(SingleArmEnv_MG):
                     from robosuite.utils.binding_utils import MjSimWarp
 
                     assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
+                    obj_pos, obj_quat = self._maybe_tip_placement(obj, obj_pos, obj_quat)
                     self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
         # Always reset the hinge joint position
@@ -1064,6 +1128,15 @@ class CoffeePreparation(Coffee):
         #       and this may break the generate_id_mappings function in task.py
         self.model.merge_objects([self.mug])  # add cleanup object to model
 
+    def _padded_objects(self) -> tuple[str, ...]:
+        return ("mug", "coffee_machine")
+
+    def _full_rotation_objects(self) -> tuple[str, ...]:
+        return ("mug",)
+
+    def _tippable_objects(self) -> tuple[str, ...]:
+        return ("mug",)
+
     def _get_initial_placement_bounds(self):
         """
         Internal function to get bounds for randomization of initial placements of objects (e.g.
@@ -1116,7 +1189,7 @@ class CoffeePreparation(Coffee):
         )
 
     def _get_placement_initializer(self):
-        bounds = self._get_initial_placement_bounds()
+        bounds = self._maybe_apply_extra_randomization(self._get_initial_placement_bounds())
 
         self.placement_initializer = SequentialCompositeSampler(name="ObjectSampler")
         self.placement_initializer.append_sampler(
@@ -1217,6 +1290,7 @@ class CoffeePreparation(Coffee):
                     self.sim.model.body_quat[body_id] = obj_quat
                 else:
                     # object has free joint - use it to set pose
+                    obj_pos, obj_quat = self._maybe_tip_placement(obj, obj_pos, obj_quat)
                     self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
         # Always reset the hinge joint position, and the cabinet slide joint position
