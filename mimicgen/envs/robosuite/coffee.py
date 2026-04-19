@@ -195,6 +195,8 @@ class Coffee(SingleArmEnv_MG):
         tipover_prob: float = 0.0,
         tipover_angle_range: tuple[float, float] = (np.pi / 3.0, np.pi / 2.0),
         tipover_z_bump: float = 0.03,
+        fall_off_termination: bool = False,
+        fall_off_z_margin: float = 0.1,
     ):
         # settings for table top
         self.table_full_size = table_full_size
@@ -215,6 +217,11 @@ class Coffee(SingleArmEnv_MG):
         self.tipover_prob = tipover_prob
         self.tipover_angle_range = tipover_angle_range
         self.tipover_z_bump = tipover_z_bump
+
+        # Early-termination on tracked objects dropping below
+        # ``table_offset[2] - fall_off_z_margin``. Feeds ``_check_early_termination``.
+        self.fall_off_termination = fall_off_termination
+        self.fall_off_z_margin = fall_off_z_margin
 
         super().__init__(
             robots=robots,
@@ -386,6 +393,52 @@ class Coffee(SingleArmEnv_MG):
         new_pos[2] += self.tipover_z_bump
         return new_pos, new_wxyz
 
+    def _maybe_tip_placement_batch(
+        self, obj, pos: np.ndarray, quat: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorised variant of :meth:`_maybe_tip_placement` for
+        ``(n, 3)`` ``pos`` + ``(n, 4)`` ``quat`` batches (wxyz). Only the rows
+        that "win" the per-env Bernoulli coin flip get tipped; others pass
+        through unchanged. Returns fresh arrays.
+        """
+        if self.tipover_prob <= 0.0 or obj.name not in self._tippable_objects():
+            return pos, quat
+
+        n = pos.shape[0]
+        tip_mask = np.random.rand(n) < self.tipover_prob
+        k = int(tip_mask.sum())
+        if k == 0:
+            return pos, quat
+
+        tip_angle = np.random.uniform(
+            low=self.tipover_angle_range[0],
+            high=self.tipover_angle_range[1],
+            size=k,
+        )
+        axis_angle = np.random.uniform(0.0, 2.0 * np.pi, size=k)
+        # axisangle2quat(axis * angle) with axis = (cos(a), sin(a), 0) reduces
+        # to tip_xyzw = (cos(a) sin(angle/2), sin(a) sin(angle/2), 0, cos(angle/2)).
+        s = np.sin(tip_angle / 2.0)
+        c = np.cos(tip_angle / 2.0)
+        tip_xyzw = np.stack(
+            [np.cos(axis_angle) * s, np.sin(axis_angle) * s, np.zeros(k), c],
+            axis=-1,
+        )
+
+        base_wxyz = quat[tip_mask]
+        # Convert wxyz -> xyzw: cols (1,2,3,0).
+        base_xyzw = base_wxyz[:, [1, 2, 3, 0]]
+        from robosuite.utils.placement_samplers import _quat_multiply_batch
+
+        new_xyzw = _quat_multiply_batch(tip_xyzw, base_xyzw)
+        new_wxyz = new_xyzw[:, [3, 0, 1, 2]]
+
+        new_quat = quat.copy()
+        new_pos = pos.copy()
+        new_quat[tip_mask] = new_wxyz
+        new_pos[tip_mask, 2] += self.tipover_z_bump
+        return new_pos, new_quat
+
     def _get_placement_initializer(self):
         bounds = self._maybe_apply_extra_randomization(self._get_initial_placement_bounds())
 
@@ -442,6 +495,17 @@ class Coffee(SingleArmEnv_MG):
         pod_holder_geom_names = ["coffee_machine_pod_holder_cup_body_hc_{}".format(i) for i in range(64)]
         self.pod_holder_geom_ids = [self.sim.model.geom_name2id(x) for x in pod_holder_geom_names]
 
+        # Gripper fingerpad geom ids, cached for warp contact queries. Fail
+        # loudly at setup if the gripper doesn't expose the expected groups.
+        gripper = self.robots[0].gripper
+        self.pod_contact_geom_ids = [self.sim.model.geom_name2id(g) for g in self.coffee_pod.contact_geoms]
+        self.left_fingerpad_geom_ids = [
+            self.sim.model.geom_name2id(g) for g in gripper.important_geoms["left_fingerpad"]
+        ]
+        self.right_fingerpad_geom_ids = [
+            self.sim.model.geom_name2id(g) for g in gripper.important_geoms["right_fingerpad"]
+        ]
+
         # size of bounding box for pod holder
         self.pod_holder_size = self.coffee_machine.pod_holder_size
 
@@ -462,25 +526,38 @@ class Coffee(SingleArmEnv_MG):
 
                 assert isinstance(self.sim, MjSimWarp)
 
-                # Sample num_envs independent configurations so each parallel env
-                # starts from a different object placement (not the same tiled config).
-                # Collect per-object stacked arrays: obj_joint -> (num_envs, 7)
-                all_placements = {}  # joint_name -> list of (pos, quat) per env
-                for _ in range(self.num_envs):
-                    placements = self.placement_initializer.sample()
-                    for obj_pos, obj_quat, obj in placements.values():
-                        obj_pos, obj_quat = self._maybe_tip_placement(obj, obj_pos, obj_quat)
-                        key = obj.joints[0]
-                        if key not in all_placements:
-                            all_placements[key] = []
-                        all_placements[key].append(np.array([*obj_pos, *obj_quat], dtype=np.float32))
+                # ``_reset_env_mask`` (a bool tensor or index iterable) lets
+                # callers resample only the envs that actually need a fresh
+                # placement. Writes to ``qpos`` are scoped to masked rows via
+                # indexed torch assign — kept envs' object state flows through
+                # untouched. (Passing a full-width ``(num_envs, 7)`` tensor
+                # through ``set_joint_qpos`` would clobber every env, which is
+                # what RobomimicVecEnv's slim reset explicitly avoids.)
+                mask = getattr(self, "_reset_env_mask", None)
+                if mask is None:
+                    sample_idxs_arr = np.arange(self.num_envs)
+                elif isinstance(mask, torch.Tensor):
+                    sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
+                else:
+                    sample_idxs_arr = np.asarray(mask).nonzero()[0]
 
-                for joint_name, vals in all_placements.items():
-                    stacked = np.stack(vals, axis=0)  # (num_envs, 7)
-                    self.sim.data.set_joint_qpos(
-                        joint_name,
-                        wp.from_numpy(stacked, dtype=wp.float32, device=self.sim._warp_data.qpos.device),
+                if sample_idxs_arr.size > 0:
+                    k = int(sample_idxs_arr.size)
+                    placements = self.placement_initializer.sample_batch(k)
+                    qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    row_idx = torch.as_tensor(
+                        sample_idxs_arr, device=qpos_t.device, dtype=torch.long
                     )
+                    for obj_pos, obj_quat, obj in placements.values():
+                        obj_pos, obj_quat = self._maybe_tip_placement_batch(obj, obj_pos, obj_quat)
+                        addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
+                        start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                        stacked = np.concatenate(
+                            [obj_pos.astype(np.float32), obj_quat.astype(np.float32)], axis=-1
+                        )  # (k, 7)
+                        qpos_t[row_idx, start:end] = torch.as_tensor(
+                            stacked, device=qpos_t.device, dtype=torch.float32
+                        )
             else:
                 # Sample from the placement initializer for all objects
                 object_placements = self.placement_initializer.sample()
@@ -493,11 +570,22 @@ class Coffee(SingleArmEnv_MG):
                     obj_pos, obj_quat = self._maybe_tip_placement(obj, obj_pos, obj_quat)
                     self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
-        # Always reset the hinge joint position
+        # Always reset the hinge joint position. Under warp we scope the
+        # write to ``_reset_env_mask`` (if set) so kept envs' lid angle flows
+        # through untouched — ``set_qpos_indexed`` would overwrite all rows.
         from robosuite.utils.binding_utils import MjSimWarp
 
         if isinstance(self.sim, MjSimWarp):
-            self.sim.data.set_qpos_indexed([self.hinge_qpos_addr], np.array([2.0 * np.pi / 3.0]))
+            import warp as wp
+            qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+            mask = getattr(self, "_reset_env_mask", None)
+            if mask is None:
+                qpos_t[:, self.hinge_qpos_addr] = 2.0 * np.pi / 3.0
+            else:
+                row_idx = (mask.nonzero().flatten() if isinstance(mask, torch.Tensor)
+                           else torch.as_tensor(np.asarray(mask).nonzero()[0],
+                                                device=qpos_t.device, dtype=torch.long))
+                qpos_t[row_idx, self.hinge_qpos_addr] = 2.0 * np.pi / 3.0
         else:
             self.sim.data.qpos[self.hinge_qpos_addr] = 2.0 * np.pi / 3.0
         self.sim.forward()
@@ -782,6 +870,28 @@ class Coffee(SingleArmEnv_MG):
         metrics = self._get_partial_task_metrics()
         return metrics["task"]
 
+    def _fall_off_tracked_objects(self) -> tuple[str, ...]:
+        """Objects whose body COM z is monitored by the fall-off check."""
+        return ("coffee_pod", "coffee_machine")
+
+    def _check_early_termination(self):
+        """Flag envs where any tracked object has dropped below the table.
+
+        Threshold is ``table_offset[2] - fall_off_z_margin``. Adds one
+        ``fell_off_<obj>`` entry per tracked object so each object's
+        fall-off rate shows up as its own telemetry bucket. Gated by
+        ``fall_off_termination`` so BC eval and demo-gen keep the original
+        (no-termination) behaviour unless opted in.
+        """
+        extras = super()._check_early_termination()
+        if not self.fall_off_termination:
+            return extras
+        threshold = float(self.table_offset[2]) - float(self.fall_off_z_margin)
+        for obj_name in self._fall_off_tracked_objects():
+            pos = self._get_body_pos(self.obj_body_id[obj_name])  # (..., 3)
+            extras[f"fell_off_{obj_name}"] = pos[..., 2] < threshold
+        return extras
+
     def _check_lid(self):
         hinge_tolerance = 15.0 * np.pi / 180.0
         return self._get_hinge_angle() < hinge_tolerance
@@ -837,20 +947,22 @@ class Coffee(SingleArmEnv_MG):
 
     def _check_pod_is_grasped(self):
         """
-        check if pod is grasped by robot — not supported for warp (returns False/zeros).
+        check if pod is grasped by robot (contact on both fingerpads).
         """
         if isinstance(self.sim, MjSimWarp):
-            return torch.zeros(self.sim.num_envs, dtype=torch.bool, device="cuda")
+            left_hit = self.sim.check_contact_groups(self.left_fingerpad_geom_ids, self.pod_contact_geom_ids)
+            right_hit = self.sim.check_contact_groups(self.right_fingerpad_geom_ids, self.pod_contact_geom_ids)
+            return left_hit & right_hit
         return self._check_grasp(
             gripper=self.robots[0].gripper, object_geoms=[g for g in self.coffee_pod.contact_geoms]
         )
 
     def _check_pod_and_pod_holder_contact(self):
         """
-        check if pod is in contact with the container — not supported for warp (returns False).
+        check if pod is in contact with the container.
         """
         if isinstance(self.sim, MjSimWarp):
-            return False
+            return self.sim.check_contact_groups([self.pod_geom_id], self.pod_holder_geom_ids)
         pod_and_pod_holder_contact = False
         for contact in self.sim.data.contact[: self.sim.data.ncon]:
             if ((contact.geom1 == self.pod_geom_id) and (contact.geom2 in self.pod_holder_geom_ids)) or (
@@ -1135,6 +1247,9 @@ class CoffeePreparation(Coffee):
         return ("mug",)
 
     def _tippable_objects(self) -> tuple[str, ...]:
+        return ("mug",)
+
+    def _fall_off_tracked_objects(self) -> tuple[str, ...]:
         return ("mug",)
 
     def _get_initial_placement_bounds(self):
