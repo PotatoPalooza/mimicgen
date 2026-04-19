@@ -17,14 +17,17 @@ Contains environments for BUDS hammer place task from robosuite task zoo repo.
 import os
 import random
 import numpy as np
+import torch
 from six import with_metaclass
 from copy import deepcopy
 
 import robosuite
+import robosuite.utils.transform_utils as T
 from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
 from robosuite.models.arenas import TableArena
 from robosuite.models.tasks import ManipulationTask
 from robosuite.models.objects import HammerObject, MujocoXMLObject
+from robosuite.utils.binding_utils import MjSimWarp
 from robosuite.utils.placement_samplers import SequentialCompositeSampler, UniformRandomSampler
 from robosuite.utils.observables import Observable, sensor
 from robosuite.utils.mjcf_utils import CustomMaterial, array_to_string, string_to_array, find_elements, add_material
@@ -42,13 +45,216 @@ class HammerCleanup_D0(HammerPlaceEnv, SingleArmEnv_MG):
     """
     Augment BUDS hammer place task for mimicgen.
     """
-    def __init__(self, robot_init_qpos=None, **kwargs):
+    def __init__(
+        self,
+        robot_init_qpos=None,
+        fall_off_termination: bool = False,
+        fall_off_z_margin: float = 0.1,
+        **kwargs,
+    ):
+        # Early-termination when the hammer drops below
+        # ``table_offset[2] - fall_off_z_margin`` (table top ~0.90 m in
+        # HammerPlaceEnv's world frame). Gated so BC eval / demo-gen
+        # keep the original no-termination behaviour unless explicitly
+        # opted in via env_kwargs.
+        self.fall_off_termination = fall_off_termination
+        self.fall_off_z_margin = fall_off_z_margin
         self.robot_init_qpos = robot_init_qpos
         HammerPlaceEnv.__init__(self, **kwargs)
 
     def edit_model_xml(self, xml_str):
         # make sure we don't get a conflict for function implementation
         return SingleArmEnv_MG.edit_model_xml(self, xml_str)
+
+    # ------------------------------------------------------------------
+    # Warp-aware setup
+    # ------------------------------------------------------------------
+
+    def _setup_references(self):
+        super()._setup_references()
+        # Geom-id caches for warp contact-group queries (`_check_success`
+        # under warp). `check_contact` silently returns False under warp
+        # so the hammer-in-drawer check must route through
+        # `sim.check_contact_groups`.
+        self.drawer_bottom_geom_id = self.sim.model.geom_name2id("CabinetObject_drawer_bottom")
+        self.sorting_object_contact_geom_ids = [
+            self.sim.model.geom_name2id(g) for g in self.sorting_object.contact_geoms
+        ]
+
+    def _create_obj_sensors(self, obj_name, modality="object"):
+        """
+        Warp-aware override of the upstream HammerPlaceEnv obj-sensors.
+        Returns per-env ``(num_envs, 3)`` / ``(num_envs, 4)`` tensors
+        under warp and the original scalar ``(3,)`` / ``(4,)`` arrays
+        under CPU sims.
+        """
+        pf = self.robots[0].robot_model.naming_prefix
+
+        @sensor(modality=modality)
+        def obj_pos(obs_cache):
+            bid = self.obj_body_id[obj_name]
+            if isinstance(self.sim, MjSimWarp):
+                return self.sim.data.body_xpos[bid]  # (N, 3)
+            return np.array(self.sim.data.body_xpos[bid])
+
+        @sensor(modality=modality)
+        def obj_quat(obs_cache):
+            bid = self.obj_body_id[obj_name]
+            if isinstance(self.sim, MjSimWarp):
+                q = self.sim.data.body_xquat[bid]  # (N, 4) wxyz
+                return q[..., [1, 2, 3, 0]]  # xyzw
+            return T.convert_quat(self.sim.data.body_xquat[bid], to="xyzw")
+
+        @sensor(modality=modality)
+        def obj_to_eef_pos(obs_cache):
+            if any([name not in obs_cache for name in
+                    [f"{obj_name}_pos", f"{obj_name}_quat", "world_pose_in_gripper"]]):
+                if isinstance(self.sim, MjSimWarp):
+                    return torch.zeros(
+                        self.num_envs, 3, dtype=torch.float32,
+                        device="cuda",
+                    )
+                return np.zeros(3)
+            if isinstance(self.sim, MjSimWarp):
+                obj_pos_t = obs_cache[f"{obj_name}_pos"]
+                obj_quat_t = obs_cache[f"{obj_name}_quat"]
+                world_poses = obs_cache["world_pose_in_gripper"]
+                obj_pose = T.pose2mat_torch(obj_pos_t, obj_quat_t)
+                rel_pose = world_poses @ obj_pose
+                obs_cache[f"{obj_name}_to_{pf}eef_quat"] = T.mat2quat_torch(rel_pose[:, :3, :3])
+                return rel_pose[:, :3, 3]
+            obj_pose = T.pose2mat((obs_cache[f"{obj_name}_pos"], obs_cache[f"{obj_name}_quat"]))
+            rel_pose = T.pose_in_A_to_pose_in_B(obj_pose, obs_cache["world_pose_in_gripper"])
+            rel_pos, rel_quat = T.mat2pose(rel_pose)
+            obs_cache[f"{obj_name}_to_{pf}eef_quat"] = rel_quat
+            return rel_pos
+
+        @sensor(modality=modality)
+        def obj_to_eef_quat(obs_cache):
+            key = f"{obj_name}_to_{pf}eef_quat"
+            if key in obs_cache:
+                return obs_cache[key]
+            if isinstance(self.sim, MjSimWarp):
+                return torch.zeros(
+                    self.num_envs, 4, dtype=torch.float32,
+                    device="cuda",
+                )
+            return np.zeros(4)
+
+        sensors = [obj_pos, obj_quat, obj_to_eef_pos, obj_to_eef_quat]
+        names = [f"{obj_name}_pos", f"{obj_name}_quat", f"{obj_name}_to_{pf}eef_pos", f"{obj_name}_to_{pf}eef_quat"]
+        return sensors, names
+
+    @property
+    def _has_gripper_contact(self):
+        """Upstream uses ``robots[0].ee_force`` which is not plumbed
+        through the warp sensor path. The (rarely-read) CPU callers
+        expect a scalar bool, so this override is only reached via the
+        warp sensor's validity-check path (returns the zero-stub
+        directly).
+        """
+        if isinstance(self.sim, MjSimWarp):
+            return torch.zeros(self.num_envs, 1, dtype=torch.float32, device="cuda")
+        return HammerPlaceEnv._has_gripper_contact.fget(self)
+
+    def _reset_internal(self):
+        """
+        Warp-aware override. D0's placement_initializer contains only the
+        hammer (drawer is positioned via XML at load time), so the warp
+        branch samples per-env hammer pose via ``sample_batch(k)`` and
+        writes only masked rows.
+        """
+        SingleArmEnv._reset_internal(self)
+
+        if not self.deterministic_reset:
+            if self.use_warp:
+                import warp as wp
+
+                assert isinstance(self.sim, MjSimWarp)
+
+                mask = getattr(self, "_reset_env_mask", None)
+                if mask is None:
+                    sample_idxs_arr = np.arange(self.num_envs)
+                elif isinstance(mask, torch.Tensor):
+                    sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
+                else:
+                    sample_idxs_arr = np.asarray(mask).nonzero()[0]
+
+                if sample_idxs_arr.size > 0:
+                    k = int(sample_idxs_arr.size)
+                    placements = self.placement_initializer.sample_batch(k)
+                    qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    row_idx = torch.as_tensor(
+                        sample_idxs_arr, device=qpos_t.device, dtype=torch.long
+                    )
+                    for obj_pos, obj_quat, obj in placements.values():
+                        addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
+                        start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                        stacked = np.concatenate(
+                            [obj_pos.astype(np.float32), obj_quat.astype(np.float32)], axis=-1
+                        )
+                        qpos_t[row_idx, start:end] = torch.as_tensor(
+                            stacked, device=qpos_t.device, dtype=torch.float32
+                        )
+            else:
+                object_placements = self.placement_initializer.sample()
+                for obj_pos, obj_quat, obj in object_placements.values():
+                    self.sim.data.set_joint_qpos(
+                        obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)])
+                    )
+
+        self.ee_force_bias = np.zeros(3)
+        self.ee_torque_bias = np.zeros(3)
+        self._history_force_torque = RingBuffer(dim=6, length=16)
+        self._recent_force_torque = []
+
+    def _check_success(self):
+        """
+        Warp-aware override of upstream HammerPlaceEnv._check_success.
+
+        Returns scalar bool under CPU sims and ``(num_envs,)`` bool
+        tensor under warp. Semantics match the upstream (position-based
+        "hammer in drawer" + cabinet-closed check).
+        """
+        if isinstance(self.sim, MjSimWarp):
+            object_pos = self.sim.data.body_xpos[self.sorting_object_id]  # (N, 3)
+            object_in_drawer = (
+                (object_pos[:, 2] < 1.0) & (object_pos[:, 2] > 0.94) & (object_pos[:, 1] > 0.22)
+            )
+            cabinet_closed = self.sim.data.qpos[self.cabinet_qpos_addrs] > -0.01  # (N,)
+            return object_in_drawer & cabinet_closed
+
+        object_pos = self.sim.data.body_xpos[self.sorting_object_id]
+        object_in_drawer = 1.0 > object_pos[2] > 0.94 and object_pos[1] > 0.22
+        cabinet_closed = self.sim.data.qpos[self.cabinet_qpos_addrs] > -0.01
+        return object_in_drawer and cabinet_closed
+
+    # ------------------------------------------------------------------
+    # Early-termination hook
+    # ------------------------------------------------------------------
+
+    def _fall_off_tracked_objects(self) -> tuple[str, ...]:
+        return ("hammer",)
+
+    def _check_early_termination(self):
+        """Terminate envs where the hammer has dropped below the table top.
+
+        Table top is at ``table_offset[2] = 0.90`` in HammerPlaceEnv's
+        world frame; threshold is ``0.90 - fall_off_z_margin``.
+        """
+        try:
+            extras = super()._check_early_termination()
+        except AttributeError:
+            extras = {}
+        if not self.fall_off_termination:
+            return extras
+        threshold = float(self.table_offset[2]) - float(self.fall_off_z_margin)
+        for obj_name in self._fall_off_tracked_objects():
+            if obj_name not in self.obj_body_id:
+                continue
+            pos = self.sim.data.body_xpos[self.obj_body_id[obj_name]]
+            extras[f"fell_off_{obj_name}"] = pos[..., 2] < threshold
+        return extras
 
     def _load_model(self):
         """
@@ -224,7 +430,18 @@ class HammerCleanup_D1(HammerCleanup_D0):
         Update from superclass to have a more stringent check that's not buggy
         (e.g. there's no check in x-position before) and that supports
         different drawer (cabinet) positions.
+
+        Warp branch routes the contact check through
+        ``sim.check_contact_groups`` — ``self.check_contact`` silently
+        returns False under warp, which would make success unreachable.
         """
+        if isinstance(self.sim, MjSimWarp):
+            cabinet_closed = self.sim.data.qpos[self.cabinet_qpos_addrs] > -0.01  # (N,)
+            object_in_drawer = self.sim.check_contact_groups(
+                [self.drawer_bottom_geom_id], self.sorting_object_contact_geom_ids
+            )  # (N,)
+            return object_in_drawer & cabinet_closed
+
         object_pos = self.sim.data.body_xpos[self.sorting_object_id]
         # object_in_drawer = 1.0 > object_pos[2] > 0.94 and object_pos[1] > 0.22
 
@@ -458,38 +675,67 @@ class HammerCleanup_D1(HammerCleanup_D0):
         """
         Update to make sure placement initializer can be used to set drawer (cabinet) pose
         even though it doesn't have a joint.
+
+        Warp branch: per-env hammer placement via ``sample_batch``, drawer
+        stays shared across envs (fixture; D1 drawer bounds sample into a
+        wider range, but ``_warp_model`` was snapshotted at XML-load so
+        CPU-side ``sim.model.body_pos`` writes don't propagate — the
+        drawer-randomization is CPU-only behaviour).
         """
         SingleArmEnv._reset_internal(self)
 
-        # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
+            if self.use_warp:
+                import warp as wp
 
-            # Sample from the placement initializer for all objects
-            object_placements = self.placement_initializer.sample()
+                assert isinstance(self.sim, MjSimWarp)
 
-            for obj_pos, obj_quat, obj in object_placements.values():
-                if obj is self.cabinet_object:
-                    # object is fixture - set pose in model
-                    body_id = self.sim.model.body_name2id(obj.root_body)
-                    obj_pos_to_set = np.array(obj_pos)
-                    obj_pos_to_set[2] = 0.905 # hardcode z-value to correspond to parent class
-                    self.sim.model.body_pos[body_id] = obj_pos_to_set
-                    self.sim.model.body_quat[body_id] = obj_quat
+                mask = getattr(self, "_reset_env_mask", None)
+                if mask is None:
+                    sample_idxs_arr = np.arange(self.num_envs)
+                elif isinstance(mask, torch.Tensor):
+                    sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
                 else:
-                    # object has free joint - use it to set pose
-                    if self.use_warp:
-                        import warp as wp
-                        from robosuite.utils.binding_utils import MjSimWarp
-                        assert isinstance(self.sim, MjSimWarp)
-                        _val = np.array([*obj_pos, *obj_quat], dtype=np.float32)
-                        self.sim.data.set_joint_qpos(
-                            obj.joints[0],
-                            wp.from_numpy(np.tile(_val, (self.num_envs, 1)), device=self.sim._warp_data.qpos.device),
+                    sample_idxs_arr = np.asarray(mask).nonzero()[0]
+
+                if sample_idxs_arr.size > 0:
+                    k = int(sample_idxs_arr.size)
+                    placements = self.placement_initializer.sample_batch(k)
+                    qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    row_idx = torch.as_tensor(
+                        sample_idxs_arr, device=qpos_t.device, dtype=torch.long
+                    )
+                    for obj_pos, obj_quat, obj in placements.values():
+                        if obj is self.cabinet_object:
+                            # Fixture — no free joint, and the warp model
+                            # was baked at init, so CPU-side body_pos
+                            # writes would be dead code under warp.
+                            continue
+                        addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
+                        start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                        stacked = np.concatenate(
+                            [obj_pos.astype(np.float32), obj_quat.astype(np.float32)], axis=-1
                         )
+                        qpos_t[row_idx, start:end] = torch.as_tensor(
+                            stacked, device=qpos_t.device, dtype=torch.float32
+                        )
+            else:
+                # Sample from the placement initializer for all objects
+                object_placements = self.placement_initializer.sample()
+
+                for obj_pos, obj_quat, obj in object_placements.values():
+                    if obj is self.cabinet_object:
+                        # object is fixture - set pose in model
+                        body_id = self.sim.model.body_name2id(obj.root_body)
+                        obj_pos_to_set = np.array(obj_pos)
+                        obj_pos_to_set[2] = 0.905 # hardcode z-value to correspond to parent class
+                        self.sim.model.body_pos[body_id] = obj_pos_to_set
+                        self.sim.model.body_quat[body_id] = obj_quat
                     else:
-                        from robosuite.utils.binding_utils import MjSimWarp
-                        assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
-                        self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+                        # object has free joint - use it to set pose
+                        self.sim.data.set_joint_qpos(
+                            obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)])
+                        )
 
         self.ee_force_bias = np.zeros(3)
         self.ee_torque_bias = np.zeros(3)

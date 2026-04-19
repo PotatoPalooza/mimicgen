@@ -189,7 +189,7 @@ class Coffee(SingleArmEnv_MG):
         renderer_config=None,
         use_warp: bool = False,
         num_envs: int = 1,
-        extra_randomization: bool = False,
+        difficulty: float = 0.0,
         placement_bounds_pad: float = 0.05,
         full_rotation_randomization: bool = True,
         tipover_prob: float = 0.0,
@@ -210,8 +210,11 @@ class Coffee(SingleArmEnv_MG):
         # whether to use ground-truth object states
         self.use_object_obs = use_object_obs
 
-        # extra reset randomization (widened bounds + optional tipover) for RL
-        self.extra_randomization = extra_randomization
+        # Randomization curriculum: difficulty in [0, 1] scales probability of
+        # tipover and bound padding; z_rot bounds linearly interpolate toward
+        # full (-pi, pi) rotation. d=0 reproduces the BC/demo-gen distribution;
+        # d=1 matches the maxed-out "extra randomization" behaviour.
+        self._difficulty = float(np.clip(difficulty, 0.0, 1.0))
         self.placement_bounds_pad = placement_bounds_pad
         self.full_rotation_randomization = full_rotation_randomization
         self.tipover_prob = tipover_prob
@@ -354,10 +357,29 @@ class Coffee(SingleArmEnv_MG):
     def _tippable_objects(self) -> tuple[str, ...]:
         return ("coffee_pod",)
 
+    @property
+    def difficulty(self) -> float:
+        return self._difficulty
+
+    def set_difficulty(self, difficulty: float) -> None:
+        """Update the randomization curriculum level.
+
+        Called from the RL training loop to ramp the reset distribution
+        from BC-matched (d=0) up to full extra randomization (d=1).
+        Takes effect on the next reset — live rollouts are unaffected.
+        The placement initializer is rebuilt so that each sub-sampler's
+        x/y/z_rot ranges reflect the new difficulty (tipover uses the
+        live value directly and needs no rebuild).
+        """
+        self._difficulty = float(np.clip(difficulty, 0.0, 1.0))
+        if getattr(self, "placement_initializer", None) is not None:
+            self._get_placement_initializer()
+
     def _maybe_apply_extra_randomization(self, bounds: dict[str, dict]) -> dict[str, dict]:
-        if not self.extra_randomization:
+        d = self._difficulty
+        if d <= 0.0:
             return bounds
-        pad = self.placement_bounds_pad
+        pad = self.placement_bounds_pad * d
         padded = set(self._padded_objects())
         full_rot = set(self._full_rotation_objects()) if self.full_rotation_randomization else set()
         out: dict[str, dict] = {}
@@ -367,17 +389,22 @@ class Coffee(SingleArmEnv_MG):
                 nb["x"] = (b["x"][0] - pad, b["x"][1] + pad)
                 nb["y"] = (b["y"][0] - pad, b["y"][1] + pad)
             if name in full_rot:
-                nb["z_rot"] = (-np.pi, np.pi)
+                lo, hi = b["z_rot"]
+                nb["z_rot"] = (lo + d * (-np.pi - lo), hi + d * (np.pi - hi))
             out[name] = nb
         return out
+
+    def _effective_tipover_prob(self) -> float:
+        return float(self.tipover_prob * self._difficulty)
 
     def _maybe_tip_placement(
         self, obj, obj_pos: np.ndarray, obj_quat: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
         # quats are (w, x, y, z) to match placement sampler + MuJoCo free-joint qpos order
-        if self.tipover_prob <= 0.0 or obj.name not in self._tippable_objects():
+        prob = self._effective_tipover_prob()
+        if prob <= 0.0 or obj.name not in self._tippable_objects():
             return obj_pos, obj_quat
-        if np.random.rand() >= self.tipover_prob:
+        if np.random.rand() >= prob:
             return obj_pos, obj_quat
 
         tip_angle = np.random.uniform(*self.tipover_angle_range)
@@ -401,11 +428,12 @@ class Coffee(SingleArmEnv_MG):
         that "win" the per-env Bernoulli coin flip get tipped; others pass
         through unchanged. Returns fresh arrays.
         """
-        if self.tipover_prob <= 0.0 or obj.name not in self._tippable_objects():
+        prob = self._effective_tipover_prob()
+        if prob <= 0.0 or obj.name not in self._tippable_objects():
             return pos, quat
 
         n = pos.shape[0]
-        tip_mask = np.random.rand(n) < self.tipover_prob
+        tip_mask = np.random.rand(n) < prob
         k = int(tip_mask.sum())
         if k == 0:
             return pos, quat
@@ -1382,94 +1410,214 @@ class CoffeePreparation(Coffee):
         self.obj_body_id["mug"] = self.sim.model.body_name2id(self.mug.root_body)
         self.drawer_bottom_geom_id = self.sim.model.geom_name2id("CabinetObject_drawer_bottom")
 
+        # Cache geom ids for warp contact-group queries. Required by
+        # _check_mug_placement and the mug-grasp partial metric, both of
+        # which silently no-op under warp when routed through the CPU
+        # check_contact / _check_grasp_tolerant helpers.
+        self.coffee_machine_base_geom_id = self.sim.model.geom_name2id("coffee_machine_base_g0")
+        self.mug_contact_geom_ids = [
+            self.sim.model.geom_name2id(g) for g in self.mug.contact_geoms
+        ]
+
     def _reset_internal(self):
         """
         Resets simulation internal configurations.
+
+        Warp branch samples placements per-env via ``sample_batch(k)``
+        with ``k = |_reset_env_mask|`` and writes only masked qpos rows.
+        The drawer is a fixture whose pose is baked into the model at
+        XML-load time — D0/D1/D2 drawer bounds are degenerate single
+        points, so the CPU-side ``sim.model.body_pos`` write is a no-op
+        under warp (``_warp_model`` is snapshotted once at init and does
+        not re-read from the CPU model).
         """
         SingleArmEnv._reset_internal(self)
 
         # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
-            # Sample from the placement initializer for all objects
-            object_placements = self.placement_initializer.sample()
+            if self.use_warp:
+                import warp as wp
 
-            # Loop through all objects and reset their positions
-            for obj_pos, obj_quat, obj in object_placements.values():
-                if obj is self.cabinet_object:
-                    # object is fixture - set pose in model
-                    body_id = self.sim.model.body_name2id(obj.root_body)
-                    obj_pos_to_set = np.array(obj_pos)
-                    # obj_pos_to_set[2] = 0.905 # hardcode z-value to correspond to parent class
-                    obj_pos_to_set[2] = 0.805  # hardcode z-value to make sure it lies on table surface
-                    self.sim.model.body_pos[body_id] = obj_pos_to_set
-                    self.sim.model.body_quat[body_id] = obj_quat
+                assert isinstance(self.sim, MjSimWarp)
+
+                mask = getattr(self, "_reset_env_mask", None)
+                if mask is None:
+                    sample_idxs_arr = np.arange(self.num_envs)
+                elif isinstance(mask, torch.Tensor):
+                    sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
                 else:
-                    # object has free joint - use it to set pose
-                    obj_pos, obj_quat = self._maybe_tip_placement(obj, obj_pos, obj_quat)
-                    self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+                    sample_idxs_arr = np.asarray(mask).nonzero()[0]
 
-        # Always reset the hinge joint position, and the cabinet slide joint position
+                if sample_idxs_arr.size > 0:
+                    k = int(sample_idxs_arr.size)
+                    placements = self.placement_initializer.sample_batch(k)
+                    qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    row_idx = torch.as_tensor(
+                        sample_idxs_arr, device=qpos_t.device, dtype=torch.long
+                    )
+                    for obj_pos, obj_quat, obj in placements.values():
+                        if obj is self.cabinet_object:
+                            # Drawer is a fixture — no free joint to write.
+                            # Under warp `_warp_model` was snapshotted at
+                            # init, so even mutating `sim.model.body_pos`
+                            # here would not propagate. D0/D1 drawer bounds
+                            # are single points so this is already correct.
+                            continue
+                        obj_pos, obj_quat = self._maybe_tip_placement_batch(obj, obj_pos, obj_quat)
+                        addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
+                        start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                        stacked = np.concatenate(
+                            [obj_pos.astype(np.float32), obj_quat.astype(np.float32)], axis=-1
+                        )  # (k, 7)
+                        qpos_t[row_idx, start:end] = torch.as_tensor(
+                            stacked, device=qpos_t.device, dtype=torch.float32
+                        )
+            else:
+                # Sample from the placement initializer for all objects
+                object_placements = self.placement_initializer.sample()
+
+                # Loop through all objects and reset their positions
+                for obj_pos, obj_quat, obj in object_placements.values():
+                    if obj is self.cabinet_object:
+                        # object is fixture - set pose in model
+                        body_id = self.sim.model.body_name2id(obj.root_body)
+                        obj_pos_to_set = np.array(obj_pos)
+                        # obj_pos_to_set[2] = 0.905 # hardcode z-value to correspond to parent class
+                        obj_pos_to_set[2] = 0.805  # hardcode z-value to make sure it lies on table surface
+                        self.sim.model.body_pos[body_id] = obj_pos_to_set
+                        self.sim.model.body_quat[body_id] = obj_quat
+                    else:
+                        # object has free joint - use it to set pose
+                        obj_pos, obj_quat = self._maybe_tip_placement(obj, obj_pos, obj_quat)
+                        self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+
+        # Always reset the hinge joint position, and the cabinet slide joint
+        # position. Under warp, scope the write to ``_reset_env_mask`` so
+        # kept envs' drawer state flows through untouched — a full-batch
+        # ``set_qpos_indexed`` would wipe in-progress drawer openings on
+        # every per-env reset.
         if isinstance(self.sim, MjSimWarp):
-            self.sim.data.set_qpos_indexed([self.hinge_qpos_addr], np.array([0.0]))
-            self.sim.data.set_qpos_indexed([self.cabinet_qpos_addr], np.array([0.0]))
+            import warp as wp
+            qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+            mask = getattr(self, "_reset_env_mask", None)
+            if mask is None:
+                qpos_t[:, self.hinge_qpos_addr] = 0.0
+                qpos_t[:, self.cabinet_qpos_addr] = 0.0
+            else:
+                row_idx = (mask.nonzero().flatten() if isinstance(mask, torch.Tensor)
+                           else torch.as_tensor(np.asarray(mask).nonzero()[0],
+                                                device=qpos_t.device, dtype=torch.long))
+                qpos_t[row_idx, self.hinge_qpos_addr] = 0.0
+                qpos_t[row_idx, self.cabinet_qpos_addr] = 0.0
         else:
             self.sim.data.qpos[self.hinge_qpos_addr] = 0.0
             self.sim.data.qpos[self.cabinet_qpos_addr] = 0.0
         self.sim.forward()
 
         if not self.deterministic_reset:
-            # sample pod location relative to center of drawer bottom geom surface
-            coffee_pod_placement = self.pod_placement_initializer.sample(on_top=False)
-            assert len(coffee_pod_placement) == 1
-            rel_pod_pos, rel_pod_quat, pod_obj = list(coffee_pod_placement.values())[0]
-            rel_pod_pos, rel_pod_quat = np.array(rel_pod_pos), np.array(rel_pod_quat)
-            assert pod_obj is self.coffee_pod
-
-            # center of drawer bottom
-            if isinstance(self.sim, MjSimWarp):
-                drawer_bottom_geom_pos = self.sim.data.geom_xpos[self.drawer_bottom_geom_id][0].cpu().numpy()
-            else:
-                drawer_bottom_geom_pos = np.array(self.sim.data.geom_xpos[self.drawer_bottom_geom_id])
-
-            # our x-y relative position is sampled with respect to drawer geom frame. Here, we use the drawer's rotation
-            # matrix to convert this relative position to a world relative position, so we can add it to the drawer world position
-            drawer_rot_mat = T.quat2mat(
-                T.convert_quat(
-                    self.sim.model.body_quat[self.sim.model.body_name2id(self.cabinet_object.root_body)], to="xyzw"
-                )
-            )
-            rel_pod_pos[:2] = drawer_rot_mat[:2, :2].dot(rel_pod_pos[:2])
-
-            # also convert the sampled pod rotation to world frame
-            rel_pod_mat = T.quat2mat(T.convert_quat(rel_pod_quat, to="xyzw"))
-            pod_mat = drawer_rot_mat.dot(rel_pod_mat)
-            pod_quat = T.convert_quat(T.mat2quat(pod_mat), to="wxyz")
-
-            # get half-sizes of drawer geom and coffee pod to place coffee pod at correct z-location (on top of drawer bottom geom)
-            drawer_bottom_geom_z_offset = self.sim.model.geom_size[self.drawer_bottom_geom_id][
-                -1
-            ]  # half-size of geom in z-direction
-            coffee_pod_bottom_offset = np.abs(self.coffee_pod.bottom_offset[-1])
-            coffee_pod_z = drawer_bottom_geom_pos[2] + drawer_bottom_geom_z_offset + coffee_pod_bottom_offset + 0.001
-
-            # set coffee pod in center of drawer
-            pod_pos = np.array(drawer_bottom_geom_pos) + rel_pod_pos
-            pod_pos[-1] = coffee_pod_z
-
             if self.use_warp:
                 import warp as wp
-                from robosuite.utils.binding_utils import MjSimWarp
-
                 assert isinstance(self.sim, MjSimWarp)
-                _val = np.array([*pod_pos, *pod_quat], dtype=np.float32)
-                self.sim.data.set_joint_qpos(
-                    pod_obj.joints[0],
-                    wp.from_numpy(np.tile(_val, (self.num_envs, 1)), device=self.sim._warp_data.qpos.device),
-                )
-            else:
-                from robosuite.utils.binding_utils import MjSimWarp
 
-                assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
+                mask = getattr(self, "_reset_env_mask", None)
+                if mask is None:
+                    sample_idxs_arr = np.arange(self.num_envs)
+                elif isinstance(mask, torch.Tensor):
+                    sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
+                else:
+                    sample_idxs_arr = np.asarray(mask).nonzero()[0]
+
+                if sample_idxs_arr.size > 0:
+                    k = int(sample_idxs_arr.size)
+                    coffee_pod_placement = self.pod_placement_initializer.sample_batch(k, on_top=False)
+                    assert len(coffee_pod_placement) == 1
+                    rel_pod_pos, rel_pod_quat, pod_obj = list(coffee_pod_placement.values())[0]
+                    rel_pod_pos = np.asarray(rel_pod_pos, dtype=np.float64)  # (k, 3)
+                    rel_pod_quat = np.asarray(rel_pod_quat, dtype=np.float64)  # (k, 4) wxyz
+                    assert pod_obj is self.coffee_pod
+
+                    # Drawer is shared across envs so use env-0's drawer
+                    # bottom geom position; the drawer rotation likewise
+                    # comes from the CPU model copy (identical for all envs).
+                    drawer_bottom_geom_pos = self.sim.data.geom_xpos[self.drawer_bottom_geom_id][0].cpu().numpy()
+                    drawer_rot_mat = T.quat2mat(
+                        T.convert_quat(
+                            self.sim.model.body_quat[self.sim.model.body_name2id(self.cabinet_object.root_body)],
+                            to="xyzw",
+                        )
+                    )
+
+                    # Rotate the sampled in-drawer offsets into the world frame.
+                    rel_pod_pos[:, :2] = rel_pod_pos[:, :2] @ drawer_rot_mat[:2, :2].T
+
+                    # Per-row quat composition into world frame (same math
+                    # as scalar path — done per-row since there are only k
+                    # of them and this runs once per masked reset).
+                    pod_quat_batch = np.empty_like(rel_pod_quat)
+                    for i in range(k):
+                        rel_pod_mat_i = T.quat2mat(T.convert_quat(rel_pod_quat[i], to="xyzw"))
+                        pod_mat_i = drawer_rot_mat.dot(rel_pod_mat_i)
+                        pod_quat_batch[i] = T.convert_quat(T.mat2quat(pod_mat_i), to="wxyz")
+
+                    drawer_bottom_geom_z_offset = self.sim.model.geom_size[self.drawer_bottom_geom_id][-1]
+                    coffee_pod_bottom_offset = np.abs(self.coffee_pod.bottom_offset[-1])
+                    coffee_pod_z = (
+                        drawer_bottom_geom_pos[2]
+                        + drawer_bottom_geom_z_offset
+                        + coffee_pod_bottom_offset
+                        + 0.001
+                    )
+
+                    pod_pos = rel_pod_pos + drawer_bottom_geom_pos  # (k, 3); drawer pos broadcast
+                    pod_pos[:, 2] = coffee_pod_z
+
+                    qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    row_idx = torch.as_tensor(
+                        sample_idxs_arr, device=qpos_t.device, dtype=torch.long
+                    )
+                    addr = self.sim.model.get_joint_qpos_addr(pod_obj.joints[0])
+                    start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                    stacked = np.concatenate(
+                        [pod_pos.astype(np.float32), pod_quat_batch.astype(np.float32)], axis=-1
+                    )  # (k, 7)
+                    qpos_t[row_idx, start:end] = torch.as_tensor(
+                        stacked, device=qpos_t.device, dtype=torch.float32
+                    )
+            else:
+                # sample pod location relative to center of drawer bottom geom surface
+                coffee_pod_placement = self.pod_placement_initializer.sample(on_top=False)
+                assert len(coffee_pod_placement) == 1
+                rel_pod_pos, rel_pod_quat, pod_obj = list(coffee_pod_placement.values())[0]
+                rel_pod_pos, rel_pod_quat = np.array(rel_pod_pos), np.array(rel_pod_quat)
+                assert pod_obj is self.coffee_pod
+
+                # center of drawer bottom
+                drawer_bottom_geom_pos = np.array(self.sim.data.geom_xpos[self.drawer_bottom_geom_id])
+
+                # our x-y relative position is sampled with respect to drawer geom frame. Here, we use the drawer's rotation
+                # matrix to convert this relative position to a world relative position, so we can add it to the drawer world position
+                drawer_rot_mat = T.quat2mat(
+                    T.convert_quat(
+                        self.sim.model.body_quat[self.sim.model.body_name2id(self.cabinet_object.root_body)], to="xyzw"
+                    )
+                )
+                rel_pod_pos[:2] = drawer_rot_mat[:2, :2].dot(rel_pod_pos[:2])
+
+                # also convert the sampled pod rotation to world frame
+                rel_pod_mat = T.quat2mat(T.convert_quat(rel_pod_quat, to="xyzw"))
+                pod_mat = drawer_rot_mat.dot(rel_pod_mat)
+                pod_quat = T.convert_quat(T.mat2quat(pod_mat), to="wxyz")
+
+                # get half-sizes of drawer geom and coffee pod to place coffee pod at correct z-location (on top of drawer bottom geom)
+                drawer_bottom_geom_z_offset = self.sim.model.geom_size[self.drawer_bottom_geom_id][
+                    -1
+                ]  # half-size of geom in z-direction
+                coffee_pod_bottom_offset = np.abs(self.coffee_pod.bottom_offset[-1])
+                coffee_pod_z = drawer_bottom_geom_pos[2] + drawer_bottom_geom_z_offset + coffee_pod_bottom_offset + 0.001
+
+                # set coffee pod in center of drawer
+                pod_pos = np.array(drawer_bottom_geom_pos) + rel_pod_pos
+                pod_pos[-1] = coffee_pod_z
                 self.sim.data.set_joint_qpos(pod_obj.joints[0], np.concatenate([np.array(pod_pos), np.array(pod_quat)]))
 
     def _setup_observables(self):
@@ -1511,11 +1659,24 @@ class CoffeePreparation(Coffee):
     def _check_mug_placement(self):
         """
         Returns true if mug has been placed successfully on the coffee machine.
+
+        Scalar bool under CPU sims; ``(num_envs,)`` bool tensor under warp.
         """
+        mug_bid = self.obj_body_id["mug"]
+        if isinstance(self.sim, MjSimWarp):
+            # body_xmat is stored as (num_envs, nbody, 3, 3). The upright
+            # check needs xmat[:, 2, 2] (z-column's z-row entry).
+            xmat = self.sim.data.body_xmat[mug_bid]  # (N, 3, 3)
+            z_axis_z = xmat[..., 2, 2]  # (N,)
+            mug_upright = (1.0 - z_axis_z) < 1e-3
+            mug_on_machine = self.sim.check_contact_groups(
+                [self.coffee_machine_base_geom_id], self.mug_contact_geom_ids
+            )
+            return mug_upright & mug_on_machine
 
         # check z-axis alignment by checking z unit-vector of obj pose and dot with (0, 0, 1)
         # then take cosine dist (1 - dot-prod)
-        obj_rot = self.sim.data.body_xmat[self.obj_body_id["mug"]].reshape(3, 3)
+        obj_rot = self.sim.data.body_xmat[mug_bid].reshape(3, 3)
         z_axis = obj_rot[:3, 2]
         dist_to_z_axis = 1.0 - z_axis[2]
         mug_upright = dist_to_z_axis < 1e-3
@@ -1530,21 +1691,39 @@ class CoffeePreparation(Coffee):
     def _get_partial_task_metrics(self):
         """
         Returns a dictionary of partial task metrics which correspond to different parts of the task being done.
+
+        Under warp all values are ``(num_envs,)`` bool tensors; under CPU
+        they are scalar bools. The ``task`` key is AND-combined with
+        mug-placement using the type-appropriate operator.
         """
 
         # populate with superclass metrics that concern the coffee pod and coffee machine
         metrics = super()._get_partial_task_metrics()
 
-        # whether mug is grasped (NOTE: the use of tolerant grasp function for mug, due to problems with contact)
-        metrics["mug_grasp"] = self._check_grasp_tolerant(
-            gripper=self.robots[0].gripper, object_geoms=[g for g in self.mug.contact_geoms]
-        )
+        # whether mug is grasped — under warp the CPU `_check_grasp_tolerant`
+        # path silently returns False on every env, so mirror Coffee's
+        # pod-grasp pattern: both fingerpads must contact the mug's geoms.
+        if isinstance(self.sim, MjSimWarp):
+            left_hit = self.sim.check_contact_groups(
+                self.left_fingerpad_geom_ids, self.mug_contact_geom_ids
+            )
+            right_hit = self.sim.check_contact_groups(
+                self.right_fingerpad_geom_ids, self.mug_contact_geom_ids
+            )
+            metrics["mug_grasp"] = left_hit & right_hit
+        else:
+            metrics["mug_grasp"] = self._check_grasp_tolerant(
+                gripper=self.robots[0].gripper, object_geoms=[g for g in self.mug.contact_geoms]
+            )
 
         # whether mug has been placed on coffee machine
         metrics["mug_place"] = self._check_mug_placement()
 
         # new task success includes mug placement
-        metrics["task"] = metrics["task"] and metrics["mug_place"]
+        if isinstance(self.sim, MjSimWarp):
+            metrics["task"] = metrics["task"] & metrics["mug_place"]
+        else:
+            metrics["task"] = metrics["task"] and metrics["mug_place"]
 
         # can have a check on drawer being closed here, to make the task even harder
         # print(self.sim.data.qpos[self.cabinet_qpos_addr])

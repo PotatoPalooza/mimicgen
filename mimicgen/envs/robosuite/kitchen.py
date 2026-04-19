@@ -15,6 +15,7 @@ Contains environments for BUDS kitchen task from robosuite task zoo repo.
 """
 import os
 import numpy as np
+import torch
 from six import with_metaclass
 from copy import deepcopy
 
@@ -24,6 +25,7 @@ from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
 from robosuite.models.arenas import TableArena
 from robosuite.models.tasks import ManipulationTask
 from robosuite.models.objects import BoxObject, MujocoXMLObject
+from robosuite.utils.binding_utils import MjSimWarp
 from robosuite.utils.placement_samplers import SequentialCompositeSampler, UniformRandomSampler
 from robosuite.utils.observables import Observable, sensor
 from robosuite.utils.mjcf_utils import CustomMaterial, array_to_string, string_to_array, find_elements, add_material
@@ -87,36 +89,212 @@ class Kitchen_D0(KitchenEnv, SingleArmEnv_MG):
     """
     Augment BUDS kitchen task for mimicgen.
     """
-    def __init__(self, **kwargs):
+    def __init__(
+        self,
+        fall_off_termination: bool = False,
+        fall_off_z_margin: float = 0.1,
+        **kwargs,
+    ):
+        # Early-termination kwargs. Threshold uses ``table_offset[2] =
+        # 0.90`` (KitchenEnv's hardcoded world-frame table height).
+        self.fall_off_termination = fall_off_termination
+        self.fall_off_z_margin = fall_off_z_margin
         KitchenEnv.__init__(self, **kwargs)
 
-        # some additional variables for better success check
-        self.has_stove_turned_on_with_pot_and_object = False
+        # some additional variables for better success check — allocated
+        # after the base init so the warp path can read self.sim.
+        self._init_stove_state_tracking()
 
     def edit_model_xml(self, xml_str):
         # make sure we don't get a conflict for function implementation
         return SingleArmEnv_MG.edit_model_xml(self, xml_str)
 
+    # ------------------------------------------------------------------
+    # Per-env state tracking for buttons / stove latches
+    # ------------------------------------------------------------------
+
+    @property
+    def _has_gripper_contact(self):
+        """Upstream reads ``robots[0].ee_force`` which is not wired
+        through warp — return per-env zero under warp.
+        """
+        if isinstance(self.sim, MjSimWarp):
+            return torch.zeros(self.num_envs, 1, dtype=torch.float32, device="cuda")
+        return KitchenEnv._has_gripper_contact.fget(self)
+
+    def _init_stove_state_tracking(self):
+        """Initialise the per-env stove / button latches.
+
+        Under warp these are ``(num_envs,)`` bool tensors on device;
+        under CPU they remain scalar bools / ``{i: bool}`` to match
+        upstream semantics. ``buttons_on`` is re-initialised below as a
+        tensor for warp so ``_post_process`` can update it in-place.
+        """
+        if isinstance(self.sim, MjSimWarp):
+            dev = "cuda"
+            self.has_stove_turned_on = torch.zeros(self.num_envs, dtype=torch.bool, device=dev)
+            self.has_stove_turned_on_with_pot_and_object = torch.zeros(
+                self.num_envs, dtype=torch.bool, device=dev
+            )
+            # Replace scalar-bool dict with per-env tensors.
+            for k in list(self.buttons_on.keys()):
+                self.buttons_on[k] = torch.zeros(self.num_envs, dtype=torch.bool, device=dev)
+        else:
+            self.has_stove_turned_on = False
+            self.has_stove_turned_on_with_pot_and_object = False
+
+    def _setup_references(self):
+        super()._setup_references()
+        # Geom-id caches for warp contact-group queries.
+        self.pot_body_geom_ids = [self.sim.model.geom_name2id("PotObject_body_0")]
+        self.stove_burner_geom_ids = [self.sim.model.geom_name2id("Stove1_collision_burner")]
+        self.bread_contact_geom_ids = [
+            self.sim.model.geom_name2id(g) for g in self.bread_ingredient.contact_geoms
+        ]
+        self.pot_contact_geom_ids = [
+            self.sim.model.geom_name2id(g) for g in self.pot_object.contact_geoms
+        ]
+
+    def _create_obj_sensors(self, obj_name, modality="object"):
+        """
+        Warp-aware override of upstream KitchenEnv obj-sensors.
+        """
+        pf = self.robots[0].robot_model.naming_prefix
+
+        @sensor(modality=modality)
+        def obj_pos(obs_cache):
+            bid = self.obj_body_id[obj_name]
+            if isinstance(self.sim, MjSimWarp):
+                return self.sim.data.body_xpos[bid]
+            return np.array(self.sim.data.body_xpos[bid])
+
+        @sensor(modality=modality)
+        def obj_quat(obs_cache):
+            bid = self.obj_body_id[obj_name]
+            if isinstance(self.sim, MjSimWarp):
+                q = self.sim.data.body_xquat[bid]
+                return q[..., [1, 2, 3, 0]]
+            return T.convert_quat(self.sim.data.body_xquat[bid], to="xyzw")
+
+        @sensor(modality=modality)
+        def obj_to_eef_pos(obs_cache):
+            if any([name not in obs_cache for name in
+                    [f"{obj_name}_pos", f"{obj_name}_quat", "world_pose_in_gripper"]]):
+                if isinstance(self.sim, MjSimWarp):
+                    return torch.zeros(
+                        self.num_envs, 3, dtype=torch.float32,
+                        device="cuda",
+                    )
+                return np.zeros(3)
+            if isinstance(self.sim, MjSimWarp):
+                obj_pos_t = obs_cache[f"{obj_name}_pos"]
+                obj_quat_t = obs_cache[f"{obj_name}_quat"]
+                world_poses = obs_cache["world_pose_in_gripper"]
+                obj_pose = T.pose2mat_torch(obj_pos_t, obj_quat_t)
+                rel_pose = world_poses @ obj_pose
+                obs_cache[f"{obj_name}_to_{pf}eef_quat"] = T.mat2quat_torch(rel_pose[:, :3, :3])
+                return rel_pose[:, :3, 3]
+            obj_pose = T.pose2mat((obs_cache[f"{obj_name}_pos"], obs_cache[f"{obj_name}_quat"]))
+            rel_pose = T.pose_in_A_to_pose_in_B(obj_pose, obs_cache["world_pose_in_gripper"])
+            rel_pos, rel_quat = T.mat2pose(rel_pose)
+            obs_cache[f"{obj_name}_to_{pf}eef_quat"] = rel_quat
+            return rel_pos
+
+        @sensor(modality=modality)
+        def obj_to_eef_quat(obs_cache):
+            key = f"{obj_name}_to_{pf}eef_quat"
+            if key in obs_cache:
+                return obs_cache[key]
+            if isinstance(self.sim, MjSimWarp):
+                return torch.zeros(
+                    self.num_envs, 4, dtype=torch.float32,
+                    device="cuda",
+                )
+            return np.zeros(4)
+
+        sensors = [obj_pos, obj_quat, obj_to_eef_pos, obj_to_eef_quat]
+        names = [f"{obj_name}_pos", f"{obj_name}_quat", f"{obj_name}_to_{pf}eef_pos", f"{obj_name}_to_{pf}eef_quat"]
+        return sensors, names
+
     def _reset_internal(self):
         """
         Update from superclass to ensure we reset state variables.
+
+        Under warp, scope the button-qpos reset and the stove-state
+        latches to ``_reset_env_mask`` so kept envs' in-progress cooking
+        state flows through untouched.
         """
         KitchenEnv._reset_internal(self)
 
-        # reset state variables
-        self.has_stove_turned_on = False
-        self.has_stove_turned_on_with_pot_and_object = False
+        mask = getattr(self, "_reset_env_mask", None)
+        if isinstance(self.sim, MjSimWarp):
+            # Ensure latches are allocated (hard-reset rebuilds sim/data).
+            if not isinstance(self.has_stove_turned_on, torch.Tensor):
+                self._init_stove_state_tracking()
+            if mask is None:
+                self.has_stove_turned_on.zero_()
+                self.has_stove_turned_on_with_pot_and_object.zero_()
+                for k in self.buttons_on:
+                    if isinstance(self.buttons_on[k], torch.Tensor):
+                        self.buttons_on[k].zero_()
+            else:
+                if isinstance(mask, torch.Tensor):
+                    m = mask.to(self.has_stove_turned_on.device)
+                else:
+                    m = torch.as_tensor(
+                        np.asarray(mask, dtype=bool),
+                        device=self.has_stove_turned_on.device,
+                    )
+                self.has_stove_turned_on[m] = False
+                self.has_stove_turned_on_with_pot_and_object[m] = False
+                for k in self.buttons_on:
+                    if isinstance(self.buttons_on[k], torch.Tensor):
+                        self.buttons_on[k][m] = False
+        else:
+            self.has_stove_turned_on = False
+            self.has_stove_turned_on_with_pot_and_object = False
 
     def _check_success(self):
         """
-        Update from superclass to make a more stringent success check that ensures
-        the pot has been placed on the stove while it is on with the object in the pot
+        More stringent success check than upstream: pot must have been
+        on the burner while the stove was on and bread was in the pot.
+
+        Returns scalar bool under CPU and ``(num_envs,)`` bool tensor
+        under warp. Latches (``has_stove_turned_on``,
+        ``has_stove_turned_on_with_pot_and_object``) are updated in place
+        before returning so subsequent steps see the same latch state.
         """
+        if isinstance(self.sim, MjSimWarp):
+            pot_pos = self.sim.data.body_xpos[self.pot_object_id]  # (N, 3)
+            serving_region_pos = self.sim.data.body_xpos[self.serving_region_id]  # (N, 3)
+            diff = torch.abs(serving_region_pos - pot_pos)
+            pot_in_serving_region = (
+                (diff[..., 0] < 0.05) & (diff[..., 1] < 0.10) & (diff[..., 2] < 0.05)
+            )
+            pot_on_burner = self.sim.check_contact_groups(
+                self.pot_body_geom_ids, self.stove_burner_geom_ids
+            )
+            object_in_pot = self.sim.check_contact_groups(
+                self.bread_contact_geom_ids, self.pot_contact_geom_ids
+            )
+            stove_on = self.buttons_on[1]  # (N,) bool tensor
+            stove_turned_off = ~stove_on
+            self.has_stove_turned_on |= stove_on
+            self.has_stove_turned_on_with_pot_and_object |= (
+                self.has_stove_turned_on & object_in_pot & pot_on_burner
+            )
+            return (
+                pot_in_serving_region
+                & stove_turned_off
+                & object_in_pot
+                & self.has_stove_turned_on_with_pot_and_object
+            )
+
         pot_pos = self.sim.data.body_xpos[self.pot_object_id]
         serving_region_pos = self.sim.data.body_xpos[self.serving_region_id]
         dist_serving_pot = serving_region_pos - pot_pos
         pot_in_serving_region = np.abs(dist_serving_pot[0]) < 0.05 and np.abs(dist_serving_pot[1]) < 0.10 and np.abs(dist_serving_pot[2]) < 0.05
-        
+
         # if pot bottom is in contact with stove
         pot_bottom_in_contact_with_stove = self.check_contact("PotObject_body_0", "Stove1_collision_burner")
 
@@ -130,6 +308,25 @@ class Kitchen_D0(KitchenEnv, SingleArmEnv_MG):
 
         return pot_in_serving_region and stove_turned_off and object_in_pot and self.has_stove_turned_on_with_pot_and_object
 
+    def _post_process(self):
+        """Per-env button state update.
+
+        Under warp reads the button qpos tensor and sets
+        ``buttons_on[i]`` directly — the scalar upstream latch logic is
+        replaced with ``buttons_on = (qpos >= 0)``, which is equivalent
+        (see upstream _post_process). Site visibility is not updated
+        under warp (visual only; not in the warp model snapshot).
+        """
+        if isinstance(self.sim, MjSimWarp):
+            for i in range(1, self.num_stoves + 1):
+                qpos = self.sim.data.qpos[self.button_qpos_addrs[i]]  # (N,)
+                if not isinstance(self.buttons_on[i], torch.Tensor):
+                    self.buttons_on[i] = (qpos >= 0.0)
+                else:
+                    self.buttons_on[i].copy_(qpos >= 0.0)
+            return
+        return KitchenEnv._post_process(self)
+
     def _get_observations(self, force_update=False):
         """
         Make sure switch states are up-to-date before observations are returned - this is also
@@ -137,6 +334,38 @@ class Kitchen_D0(KitchenEnv, SingleArmEnv_MG):
         """
         self._post_process()
         return KitchenEnv._get_observations(self, force_update=force_update)
+
+    # ------------------------------------------------------------------
+    # Early-termination hook
+    # ------------------------------------------------------------------
+
+    def _fall_off_tracked_objects(self) -> tuple[str, ...]:
+        return ("pot", "bread")
+
+    def _check_early_termination(self):
+        """Terminate envs where the pot or bread drops below the table top.
+
+        Threshold is ``table_offset[2] - fall_off_z_margin``
+        (KitchenEnv uses ``table_offset[2] = 0.90`` hardcoded).
+        """
+        try:
+            extras = super()._check_early_termination()
+        except AttributeError:
+            extras = {}
+        if not self.fall_off_termination:
+            return extras
+        threshold = float(self.table_offset[2]) - float(self.fall_off_z_margin)
+        name_to_bid = {
+            "pot": self.pot_object_id,
+            "bread": self.sim.model.body_name2id(self.bread_ingredient.root_body),
+        }
+        for obj_name in self._fall_off_tracked_objects():
+            bid = name_to_bid.get(obj_name)
+            if bid is None:
+                continue
+            pos = self.sim.data.body_xpos[bid]
+            extras[f"fell_off_{obj_name}"] = pos[..., 2] < threshold
+        return extras
 
 
 class Kitchen_D1(Kitchen_D0):
@@ -148,54 +377,110 @@ class Kitchen_D1(Kitchen_D0):
         """
         Update to make sure placement initializer can be used to set poses of objects
         that used to be fixtures before.
+
+        Warp branch: mask-aware ``sample_batch(k)`` for free-joint
+        objects (bread, pot); fixtures (stove, button, serving region)
+        are baked into the model at XML-load time and not re-randomised
+        under warp (``_warp_model`` is a snapshot). Button qpos and
+        stove-state latches are scoped to ``_reset_env_mask``.
         """
         SingleArmEnv._reset_internal(self)
-        self.has_stove_turned_on = False 
 
-        # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
+            if self.use_warp:
+                import warp as wp
 
-            # Sample from the placement initializer for all objects
-            object_placements = self.placement_initializer.sample()
+                assert isinstance(self.sim, MjSimWarp)
 
-            for obj_pos, obj_quat, obj in object_placements.values():
-                if obj.name in self._hardcoded_z_offsets:
-                    # object is fixture - set pose in model
-                    body_id = self.sim.model.body_name2id(obj.root_body)
-                    obj_pos_to_set = np.array(obj_pos)
-                    obj_pos_to_set[2] = self._hardcoded_z_offsets[obj.name] # hardcode z-value to correspond to parent class
-                    self.sim.model.body_pos[body_id] = obj_pos_to_set
-                    self.sim.model.body_quat[body_id] = obj_quat
+                mask = getattr(self, "_reset_env_mask", None)
+                if mask is None:
+                    sample_idxs_arr = np.arange(self.num_envs)
+                elif isinstance(mask, torch.Tensor):
+                    sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
                 else:
-                    # object has free joint - use it to set pose
-                    if self.use_warp:
-                        import warp as wp
-                        from robosuite.utils.binding_utils import MjSimWarp
-                        assert isinstance(self.sim, MjSimWarp)
-                        _val = np.array([*obj_pos, *obj_quat], dtype=np.float32)
-                        self.sim.data.set_joint_qpos(
-                            obj.joints[0],
-                            wp.from_numpy(np.tile(_val, (self.num_envs, 1)), device=self.sim._warp_data.qpos.device),
+                    sample_idxs_arr = np.asarray(mask).nonzero()[0]
+
+                if sample_idxs_arr.size > 0:
+                    k = int(sample_idxs_arr.size)
+                    placements = self.placement_initializer.sample_batch(k)
+                    qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    row_idx = torch.as_tensor(
+                        sample_idxs_arr, device=qpos_t.device, dtype=torch.long
+                    )
+                    for obj_pos, obj_quat, obj in placements.values():
+                        if obj.name in self._hardcoded_z_offsets:
+                            # Fixture — no free joint; warp model snapshot.
+                            continue
+                        addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
+                        start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                        stacked = np.concatenate(
+                            [obj_pos.astype(np.float32), obj_quat.astype(np.float32)], axis=-1
                         )
+                        qpos_t[row_idx, start:end] = torch.as_tensor(
+                            stacked, device=qpos_t.device, dtype=torch.float32
+                        )
+            else:
+                object_placements = self.placement_initializer.sample()
+
+                for obj_pos, obj_quat, obj in object_placements.values():
+                    if obj.name in self._hardcoded_z_offsets:
+                        body_id = self.sim.model.body_name2id(obj.root_body)
+                        obj_pos_to_set = np.array(obj_pos)
+                        obj_pos_to_set[2] = self._hardcoded_z_offsets[obj.name]
+                        self.sim.model.body_pos[body_id] = obj_pos_to_set
+                        self.sim.model.body_quat[body_id] = obj_quat
                     else:
-                        from robosuite.utils.binding_utils import MjSimWarp
-                        assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
-                        self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+                        self.sim.data.set_joint_qpos(
+                            obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)])
+                        )
 
         self.ee_force_bias = np.zeros(3)
         self.ee_torque_bias = np.zeros(3)
         self._history_force_torque = RingBuffer(dim=6, length=16)
         self._recent_force_torque = []
 
-        # reset state variables
-        self.buttons_on = {1: False}
-        self.has_stove_turned_on = False
-        self.has_stove_turned_on_with_pot_and_object = False
+        # Reset stove/button latches (mask-aware under warp — see
+        # Kitchen_D0._reset_internal for the masked tensor path).
+        if isinstance(self.sim, MjSimWarp):
+            if not isinstance(self.has_stove_turned_on, torch.Tensor):
+                self._init_stove_state_tracking()
+            mask = getattr(self, "_reset_env_mask", None)
+            if mask is None:
+                self.has_stove_turned_on.zero_()
+                self.has_stove_turned_on_with_pot_and_object.zero_()
+                for k in self.buttons_on:
+                    if isinstance(self.buttons_on[k], torch.Tensor):
+                        self.buttons_on[k].zero_()
+            else:
+                m = (mask.to(self.has_stove_turned_on.device) if isinstance(mask, torch.Tensor)
+                     else torch.as_tensor(np.asarray(mask, dtype=bool),
+                                          device=self.has_stove_turned_on.device))
+                self.has_stove_turned_on[m] = False
+                self.has_stove_turned_on_with_pot_and_object[m] = False
+                for k in self.buttons_on:
+                    if isinstance(self.buttons_on[k], torch.Tensor):
+                        self.buttons_on[k][m] = False
+        else:
+            self.buttons_on = {1: False}
+            self.has_stove_turned_on = False
+            self.has_stove_turned_on_with_pot_and_object = False
 
-        # make sure switch is off
-        self.sim.data.qpos[self.button_qpos_addrs[1]] = -0.3
-        for stove_num, stove_status in self.buttons_on.items():
-            self.stoves[stove_num].set_sites_visibility(sim=self.sim, visible=stove_status)
+        # Switch-off qpos reset (mask-aware under warp).
+        if isinstance(self.sim, MjSimWarp):
+            import warp as wp
+            qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+            mask = getattr(self, "_reset_env_mask", None)
+            if mask is None:
+                qpos_t[:, self.button_qpos_addrs[1]] = -0.3
+            else:
+                row_idx = (mask.nonzero().flatten() if isinstance(mask, torch.Tensor)
+                           else torch.as_tensor(np.asarray(mask).nonzero()[0],
+                                                device=qpos_t.device, dtype=torch.long))
+                qpos_t[row_idx, self.button_qpos_addrs[1]] = -0.3
+        else:
+            self.sim.data.qpos[self.button_qpos_addrs[1]] = -0.3
+            for stove_num, stove_status in self.buttons_on.items():
+                self.stoves[stove_num].set_sites_visibility(sim=self.sim, visible=stove_status)
 
     def _get_initial_placement_bounds(self):
         """

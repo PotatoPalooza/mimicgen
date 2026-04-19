@@ -19,6 +19,7 @@ import random
 from collections import OrderedDict
 from copy import deepcopy
 import numpy as np
+import torch
 
 from robosuite.utils.mjcf_utils import CustomMaterial, add_material, find_elements, string_to_array
 
@@ -26,6 +27,7 @@ import robosuite.utils.transform_utils as T
 
 from robosuite.models.arenas import TableArena
 from robosuite.models.tasks import ManipulationTask
+from robosuite.utils.binding_utils import MjSimWarp
 from robosuite.utils.placement_samplers import SequentialCompositeSampler, UniformRandomSampler
 from robosuite.utils.observables import Observable, sensor
 
@@ -185,7 +187,15 @@ class MugCleanup(SingleArmEnv_MG):
         shapenet_scale=0.8,
         use_warp: bool = False,
         num_envs: int = 1,
+        fall_off_termination: bool = False,
+        fall_off_z_margin: float = 0.1,
     ):
+        # Early-termination when the mug drops below
+        # ``table_offset[2] - fall_off_z_margin``. Gated so BC eval /
+        # demo-gen keep the no-termination behaviour by default.
+        self.fall_off_termination = fall_off_termination
+        self.fall_off_z_margin = fall_off_z_margin
+
         # shapenet mug to use
         self._shapenet_id = shapenet_id
         self._shapenet_scale = shapenet_scale
@@ -233,32 +243,23 @@ class MugCleanup(SingleArmEnv_MG):
 
     def reward(self, action: np.ndarray | wp.array | None = None) -> float:
         """
-        Reward function for the task.
+        Sparse completion reward.
 
-        The sparse reward only consists of the threading component.
-
-        Note that the final reward is normalized and scaled by
-        reward_scale / 2.0 as well so that the max score is equal to reward_scale
-
-        Args:
-            action (np array): [NOT USED]
-
-        Returns:
-            float: reward value
+        Scalar float under CPU sims; ``(num_envs,)`` float tensor under
+        warp (matches the Threading pattern — the RSL-RL wrapper treats
+        scalars and per-env tensors uniformly).
         """
-        reward = 0.
+        success = self._check_success()
 
-        # sparse completion reward
-        if self._check_success():
-            reward = 1.0
+        if isinstance(success, torch.Tensor):
+            reward = success.float()
+            if self.reward_scale is not None:
+                reward = reward * self.reward_scale
+            return reward
 
-        # use a shaping reward
-        if self.reward_shaping:
-            pass
-
+        reward = 1.0 if success else 0.0
         if self.reward_scale is not None:
             reward *= self.reward_scale
-
         return reward
 
     def _load_model(self):
@@ -456,47 +457,86 @@ class MugCleanup(SingleArmEnv_MG):
         )
         self.drawer_qpos_addr = self.sim.model.get_joint_qpos_addr(self.drawer.joints[0])
         self.drawer_bottom_geom_id = self.sim.model.geom_name2id("DrawerObject_drawer_bottom")
+        # Geom ids used by warp contact-group queries (`_check_success`).
+        self.cleanup_object_contact_geom_ids = [
+            self.sim.model.geom_name2id(g) for g in self.cleanup_object.contact_geoms
+        ]
 
     def _reset_internal(self):
         """
         Resets simulation internal configurations.
+
+        Warp branch samples per-env mug placement via ``sample_batch(k)``
+        with ``k = |_reset_env_mask|``. Drawer is a fixture whose pose is
+        baked into the model at XML-load time; ``_warp_model`` is
+        snapshotted once at init and does not re-read CPU-model writes,
+        so drawer randomization is effectively CPU-only.
         """
         super()._reset_internal()
 
-        # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
+            if self.use_warp:
+                import warp as wp
 
-            # Sample from the placement initializer for all objects
-            object_placements = self.placement_initializer.sample()
+                assert isinstance(self.sim, MjSimWarp)
 
-            # Loop through all objects and reset their positions
-            for obj_pos, obj_quat, obj in object_placements.values():
-                if obj is self.drawer:
-                    # object is fixture - set pose in model
-                    body_id = self.sim.model.body_name2id(obj.root_body)
-                    obj_pos_to_set = np.array(obj_pos)
-                    obj_pos_to_set[2] = 0.805 # hardcode z-value to make sure it lies on table surface
-                    self.sim.model.body_pos[body_id] = obj_pos_to_set
-                    self.sim.model.body_quat[body_id] = obj_quat
+                mask = getattr(self, "_reset_env_mask", None)
+                if mask is None:
+                    sample_idxs_arr = np.arange(self.num_envs)
+                elif isinstance(mask, torch.Tensor):
+                    sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
                 else:
-                    # object has free joint - use it to set pose
-                    if self.use_warp:
-                        import warp as wp
-                        from robosuite.utils.binding_utils import MjSimWarp
-                        assert isinstance(self.sim, MjSimWarp)
-                        _val = np.array([*obj_pos, *obj_quat], dtype=np.float32)
-                        self.sim.data.set_joint_qpos(
-                            obj.joints[0],
-                            wp.from_numpy(np.tile(_val, (self.num_envs, 1)), device=self.sim._warp_data.qpos.device),
-                        )
-                    else:
-                        from robosuite.utils.binding_utils import MjSimWarp
-                        assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
-                        self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+                    sample_idxs_arr = np.asarray(mask).nonzero()[0]
 
-        # Drawer should start closed (0.) but can set to open (-0.135) for debugging.
-        self.sim.data.qpos[self.drawer_qpos_addr] = 0.
-        # self.sim.data.qpos[self.drawer_qpos_addr] = -0.135
+                if sample_idxs_arr.size > 0:
+                    k = int(sample_idxs_arr.size)
+                    placements = self.placement_initializer.sample_batch(k)
+                    qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    row_idx = torch.as_tensor(
+                        sample_idxs_arr, device=qpos_t.device, dtype=torch.long
+                    )
+                    for obj_pos, obj_quat, obj in placements.values():
+                        if obj is self.drawer:
+                            # Fixture — warp model was snapshotted at init.
+                            continue
+                        addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
+                        start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                        stacked = np.concatenate(
+                            [obj_pos.astype(np.float32), obj_quat.astype(np.float32)], axis=-1
+                        )
+                        qpos_t[row_idx, start:end] = torch.as_tensor(
+                            stacked, device=qpos_t.device, dtype=torch.float32
+                        )
+            else:
+                object_placements = self.placement_initializer.sample()
+                for obj_pos, obj_quat, obj in object_placements.values():
+                    if obj is self.drawer:
+                        body_id = self.sim.model.body_name2id(obj.root_body)
+                        obj_pos_to_set = np.array(obj_pos)
+                        obj_pos_to_set[2] = 0.805 # hardcode z-value to make sure it lies on table surface
+                        self.sim.model.body_pos[body_id] = obj_pos_to_set
+                        self.sim.model.body_quat[body_id] = obj_quat
+                    else:
+                        self.sim.data.set_joint_qpos(
+                            obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)])
+                        )
+
+        # Drawer joint position: always reset to 0 (closed). Under warp,
+        # scope the write to ``_reset_env_mask`` so kept envs' in-progress
+        # drawer state flows through untouched.
+        if isinstance(self.sim, MjSimWarp):
+            import warp as wp
+            qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+            mask = getattr(self, "_reset_env_mask", None)
+            if mask is None:
+                qpos_t[:, self.drawer_qpos_addr] = 0.0
+            else:
+                row_idx = (mask.nonzero().flatten() if isinstance(mask, torch.Tensor)
+                           else torch.as_tensor(np.asarray(mask).nonzero()[0],
+                                                device=qpos_t.device, dtype=torch.long))
+                qpos_t[row_idx, self.drawer_qpos_addr] = 0.0
+        else:
+            self.sim.data.qpos[self.drawer_qpos_addr] = 0.
         self.sim.forward()
 
     def _setup_observables(self):
@@ -517,8 +557,13 @@ class MugCleanup(SingleArmEnv_MG):
             # for conversion to relative gripper frame
             @sensor(modality=modality)
             def world_pose_in_gripper(obs_cache):
-                return T.pose_inv(T.pose2mat((obs_cache[f"{pf}eef_pos"], obs_cache[f"{pf}eef_quat"]))) if\
-                    f"{pf}eef_pos" in obs_cache and f"{pf}eef_quat" in obs_cache else np.eye(4)
+                if f"{pf}eef_pos" not in obs_cache or f"{pf}eef_quat" not in obs_cache:
+                    return np.eye(4)
+                eef_pos = obs_cache[f"{pf}eef_pos"]
+                eef_quat = obs_cache[f"{pf}eef_quat"]
+                if isinstance(self.sim, MjSimWarp):
+                    return T.pose_inv_torch(T.pose2mat_torch(eef_pos, eef_quat))
+                return T.pose_inv(T.pose2mat((eef_pos, eef_quat)))
             sensors = [world_pose_in_gripper]
             names = ["world_pose_in_gripper"]
             actives = [False]
@@ -533,6 +578,8 @@ class MugCleanup(SingleArmEnv_MG):
             # add joint position of drawer
             @sensor(modality=modality)
             def drawer_joint_pos(obs_cache):
+                if isinstance(self.sim, MjSimWarp):
+                    return self.sim.data.qpos[[self.drawer_qpos_addr]]  # (num_envs, 1) tensor
                 return np.array([self.sim.data.qpos[self.drawer_qpos_addr]])
             sensors += [drawer_joint_pos]
             names += ["drawer_joint_pos"]
@@ -568,18 +615,38 @@ class MugCleanup(SingleArmEnv_MG):
 
         @sensor(modality=modality)
         def obj_pos(obs_cache):
-            return np.array(self.sim.data.body_xpos[self.obj_body_id[obj_name]])
+            bid = self.obj_body_id[obj_name]
+            if isinstance(self.sim, MjSimWarp):
+                return self.sim.data.body_xpos[bid]  # (N, 3)
+            return np.array(self.sim.data.body_xpos[bid])
 
         @sensor(modality=modality)
         def obj_quat(obs_cache):
-            return T.convert_quat(self.sim.data.body_xquat[self.obj_body_id[obj_name]], to="xyzw")
+            bid = self.obj_body_id[obj_name]
+            if isinstance(self.sim, MjSimWarp):
+                q = self.sim.data.body_xquat[bid]  # (N, 4) wxyz
+                return q[..., [1, 2, 3, 0]]
+            return T.convert_quat(self.sim.data.body_xquat[bid], to="xyzw")
 
         @sensor(modality=modality)
         def obj_to_eef_pos(obs_cache):
             # Immediately return default value if cache is empty
             if any([name not in obs_cache for name in
                     [f"{obj_name}_pos", f"{obj_name}_quat", "world_pose_in_gripper"]]):
+                if isinstance(self.sim, MjSimWarp):
+                    return torch.zeros(
+                        self.num_envs, 3, dtype=torch.float32,
+                        device="cuda",
+                    )
                 return np.zeros(3)
+            if isinstance(self.sim, MjSimWarp):
+                obj_pos_t = obs_cache[f"{obj_name}_pos"]
+                obj_quat_t = obs_cache[f"{obj_name}_quat"]
+                world_poses = obs_cache["world_pose_in_gripper"]
+                obj_pose = T.pose2mat_torch(obj_pos_t, obj_quat_t)
+                rel_pose = world_poses @ obj_pose
+                obs_cache[f"{obj_name}_to_{pf}eef_quat"] = T.mat2quat_torch(rel_pose[:, :3, :3])
+                return rel_pose[:, :3, 3]
             obj_pose = T.pose2mat((obs_cache[f"{obj_name}_pos"], obs_cache[f"{obj_name}_quat"]))
             rel_pose = T.pose_in_A_to_pose_in_B(obj_pose, obs_cache["world_pose_in_gripper"])
             rel_pos, rel_quat = T.mat2pose(rel_pose)
@@ -588,8 +655,15 @@ class MugCleanup(SingleArmEnv_MG):
 
         @sensor(modality=modality)
         def obj_to_eef_quat(obs_cache):
-            return obs_cache[f"{obj_name}_to_{pf}eef_quat"] if \
-                f"{obj_name}_to_{pf}eef_quat" in obs_cache else np.zeros(4)
+            key = f"{obj_name}_to_{pf}eef_quat"
+            if key in obs_cache:
+                return obs_cache[key]
+            if isinstance(self.sim, MjSimWarp):
+                return torch.zeros(
+                    self.num_envs, 4, dtype=torch.float32,
+                    device="cuda",
+                )
+            return np.zeros(4)
 
         sensors = [obj_pos, obj_quat, obj_to_eef_pos, obj_to_eef_quat]
         names = [f"{obj_name}_pos", f"{obj_name}_quat", f"{obj_name}_to_{pf}eef_pos", f"{obj_name}_to_{pf}eef_quat"]
@@ -599,7 +673,18 @@ class MugCleanup(SingleArmEnv_MG):
     def _check_success(self):
         """
         Check if task is complete.
+
+        Scalar bool under CPU sims; ``(num_envs,)`` bool tensor under warp.
         """
+        if isinstance(self.sim, MjSimWarp):
+            drawer_closed = self.sim.data.qpos[self.drawer_qpos_addr] > -0.01  # (N,)
+            # body_xmat is (N, nbody, 3, 3); upright check uses xmat[:, 2, 2].
+            xmat = self.sim.data.body_xmat[self.obj_body_id["object"]]  # (N, 3, 3)
+            object_upright = (1.0 - xmat[..., 2, 2]) < 1e-3
+            object_in_drawer = self.sim.check_contact_groups(
+                [self.drawer_bottom_geom_id], self.cleanup_object_contact_geom_ids
+            )
+            return object_in_drawer & object_upright & drawer_closed
 
         # check for closed drawer
         drawer_closed = self.sim.data.qpos[self.drawer_qpos_addr] > -0.01
@@ -618,6 +703,29 @@ class MugCleanup(SingleArmEnv_MG):
         object_in_drawer = self.check_contact(drawer_bottom_geom, self.cleanup_object)
 
         return (object_in_drawer and object_upright and drawer_closed)
+
+    # ------------------------------------------------------------------
+    # Early-termination hook
+    # ------------------------------------------------------------------
+
+    def _fall_off_tracked_objects(self) -> tuple[str, ...]:
+        return ("object",)
+
+    def _check_early_termination(self):
+        """Terminate envs where the cleanup mug has dropped below the table top."""
+        try:
+            extras = super()._check_early_termination()
+        except AttributeError:
+            extras = {}
+        if not self.fall_off_termination:
+            return extras
+        threshold = float(self.table_offset[2]) - float(self.fall_off_z_margin)
+        for obj_name in self._fall_off_tracked_objects():
+            if obj_name not in self.obj_body_id:
+                continue
+            pos = self.sim.data.body_xpos[self.obj_body_id[obj_name]]
+            extras[f"fell_off_{obj_name}"] = pos[..., 2] < threshold
+        return extras
 
     def visualize(self, vis_settings):
         """

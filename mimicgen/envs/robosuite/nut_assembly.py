@@ -3,6 +3,7 @@
 # Licensed under the NVIDIA Source Code License [see LICENSE for details].
 
 import numpy as np
+import torch
 from six import with_metaclass
 
 import robosuite
@@ -11,6 +12,7 @@ from robosuite.environments.manipulation.nut_assembly import NutAssembly, NutAss
 from robosuite.models.arenas import PegsArena
 from robosuite.models.objects import SquareNutObject, RoundNutObject
 from robosuite.models.tasks import ManipulationTask
+from robosuite.utils.binding_utils import MjSimWarp
 from robosuite.utils.placement_samplers import SequentialCompositeSampler, UniformRandomSampler
 from robosuite.utils.observables import Observable, sensor
 from robosuite.utils.mjcf_utils import array_to_string, string_to_array, find_elements
@@ -148,53 +150,108 @@ class Square_D1(Square_D0):
     def _reset_internal(self):
         """
         Modify from superclass to keep sampling nut locations until there's no collision with either peg.
+
+        Warp branch samples per-env via ``sample_batch(k)`` and runs peg-
+        overlap rejection vectorised — only still-invalid rows resample
+        each iteration. Writes are scoped to ``_reset_env_mask`` so kept
+        envs' nut qpos flows through untouched.
         """
         SingleArmEnv._reset_internal(self)
 
         # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
+            if self.use_warp:
+                import warp as wp
 
-            success = False
-            for _ in range(5000): # 5000 retries
+                assert isinstance(self.sim, MjSimWarp)
 
-                # Sample from the placement initializer for all objects
-                object_placements = self.placement_initializer.sample()
+                mask = getattr(self, "_reset_env_mask", None)
+                if mask is None:
+                    sample_idxs_arr = np.arange(self.num_envs)
+                elif isinstance(mask, torch.Tensor):
+                    sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
+                else:
+                    sample_idxs_arr = np.asarray(mask).nonzero()[0]
 
-                # ADDED: check collision with pegs and maybe re-sample
-                location_valid = True
-                for obj_pos, obj_quat, obj in object_placements.values():
-                    horizontal_radius = obj.horizontal_radius
-
+                if sample_idxs_arr.size > 0:
+                    k = int(sample_idxs_arr.size)
                     peg1_id = self.sim.model.body_name2id("peg1")
-                    peg1_pos = np.array(self.sim.data.body_xpos[peg1_id])
-                    peg1_horizontal_radius = self.peg1_horizontal_radius
-                    if (
-                        np.linalg.norm((obj_pos[0] - peg1_pos[0], obj_pos[1] - peg1_pos[1]))
-                        <= peg1_horizontal_radius + horizontal_radius
-                    ):
-                        location_valid = False
-                        break
-
                     peg2_id = self.sim.model.body_name2id("peg2")
-                    peg2_pos = np.array(self.sim.data.body_xpos[peg2_id])
-                    peg2_horizontal_radius = self.peg2_horizontal_radius
-                    if (
-                        np.linalg.norm((obj_pos[0] - peg2_pos[0], obj_pos[1] - peg2_pos[1]))
-                        <= peg2_horizontal_radius + horizontal_radius
-                    ):
-                        location_valid = False
+                    peg1_pos_np = self.sim.data.body_xpos[peg1_id].cpu().numpy()[0]  # pegs fixed across envs
+                    peg2_pos_np = self.sim.data.body_xpos[peg2_id].cpu().numpy()[0]
+
+                    placements = None
+                    for _ in range(5000):
+                        placements = self.placement_initializer.sample_batch(k)
+                        location_valid = np.ones(k, dtype=bool)
+                        for obj_pos, obj_quat, obj in placements.values():
+                            horizontal_radius = obj.horizontal_radius
+                            d1 = np.linalg.norm(obj_pos[:, :2] - peg1_pos_np[:2], axis=-1)
+                            location_valid &= d1 > (self.peg1_horizontal_radius + horizontal_radius)
+                            d2 = np.linalg.norm(obj_pos[:, :2] - peg2_pos_np[:2], axis=-1)
+                            location_valid &= d2 > (self.peg2_horizontal_radius + horizontal_radius)
+                        if location_valid.all():
+                            break
+                    else:
+                        raise RandomizationError(
+                            f"Cannot place all objects for {int((~location_valid).sum())}/{k} envs"
+                        )
+
+                    qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    row_idx = torch.as_tensor(
+                        sample_idxs_arr, device=qpos_t.device, dtype=torch.long
+                    )
+                    for obj_pos, obj_quat, obj in placements.values():
+                        addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
+                        start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                        stacked = np.concatenate(
+                            [obj_pos.astype(np.float32), obj_quat.astype(np.float32)], axis=-1
+                        )
+                        qpos_t[row_idx, start:end] = torch.as_tensor(
+                            stacked, device=qpos_t.device, dtype=torch.float32
+                        )
+            else:
+                success = False
+                for _ in range(5000): # 5000 retries
+
+                    # Sample from the placement initializer for all objects
+                    object_placements = self.placement_initializer.sample()
+
+                    # ADDED: check collision with pegs and maybe re-sample
+                    location_valid = True
+                    for obj_pos, obj_quat, obj in object_placements.values():
+                        horizontal_radius = obj.horizontal_radius
+
+                        peg1_id = self.sim.model.body_name2id("peg1")
+                        peg1_pos = np.array(self.sim.data.body_xpos[peg1_id])
+                        peg1_horizontal_radius = self.peg1_horizontal_radius
+                        if (
+                            np.linalg.norm((obj_pos[0] - peg1_pos[0], obj_pos[1] - peg1_pos[1]))
+                            <= peg1_horizontal_radius + horizontal_radius
+                        ):
+                            location_valid = False
+                            break
+
+                        peg2_id = self.sim.model.body_name2id("peg2")
+                        peg2_pos = np.array(self.sim.data.body_xpos[peg2_id])
+                        peg2_horizontal_radius = self.peg2_horizontal_radius
+                        if (
+                            np.linalg.norm((obj_pos[0] - peg2_pos[0], obj_pos[1] - peg2_pos[1]))
+                            <= peg2_horizontal_radius + horizontal_radius
+                        ):
+                            location_valid = False
+                            break
+
+                    if location_valid:
+                        success = True
                         break
 
-                if location_valid:
-                    success = True
-                    break
+                if not success:
+                    raise RandomizationError("Cannot place all objects ):")
 
-            if not success:
-                raise RandomizationError("Cannot place all objects ):")
-
-            # Loop through all objects and reset their positions
-            for obj_pos, obj_quat, obj in object_placements.values():
-                self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+                # Loop through all objects and reset their positions
+                for obj_pos, obj_quat, obj in object_placements.values():
+                    self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
         # Move objects out of the scene depending on the mode
         nut_names = {nut.name for nut in self.nuts}
@@ -327,6 +384,8 @@ class Square_D1(Square_D0):
 
             @sensor(modality=modality)
             def peg_pos(obs_cache):
+                if isinstance(self.sim, MjSimWarp):
+                    return self.sim.data.body_xpos[peg1_id]  # (N, 3)
                 return np.array(self.sim.data.body_xpos[peg1_id])
 
             name = "peg1_pos"
