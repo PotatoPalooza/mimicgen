@@ -12,10 +12,12 @@ if TYPE_CHECKING:
 from collections import OrderedDict
 
 import numpy as np
+import torch
 
 import robosuite.utils.transform_utils as T
 from robosuite.models.arenas import TableArena
 from robosuite.models.tasks import ManipulationTask
+from robosuite.utils.binding_utils import MjSimWarp
 from robosuite.utils.mjcf_utils import CustomMaterial
 from robosuite.utils.placement_samplers import SequentialCompositeSampler, UniformRandomSampler
 from robosuite.utils.observables import Observable, sensor
@@ -221,28 +223,20 @@ class Threading(SingleArmEnv_MG):
 
         The sparse reward only consists of the threading component.
 
-        Note that the final reward is normalized and scaled by
-        reward_scale / 2.0 as well so that the max score is equal to reward_scale
-
-        Args:
-            action (np array): [NOT USED]
-
-        Returns:
-            float: reward value
+        Returns a float under single-env sims and a ``(num_envs,)`` float
+        tensor under warp.
         """
-        reward = 0.
+        success = self._check_success()
 
-        # sparse completion reward
-        if self._check_success():
-            reward = 1.0
+        if isinstance(success, torch.Tensor):
+            reward = success.float()
+            if self.reward_scale is not None:
+                reward = reward * self.reward_scale
+            return reward
 
-        # use a shaping reward
-        if self.reward_shaping:
-            pass
-
+        reward = 1.0 if success else 0.0
         if self.reward_scale is not None:
             reward *= self.reward_scale
-
         return reward
 
     def _load_model(self):
@@ -367,24 +361,48 @@ class Threading(SingleArmEnv_MG):
 
         # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
+            if self.use_warp:
+                import warp as wp
 
-            # Sample from the placement initializer for all objects
-            object_placements = self.placement_initializer.sample()
+                assert isinstance(self.sim, MjSimWarp)
 
-            # Loop through all objects and reset their positions
-            for obj_pos, obj_quat, obj in object_placements.values():
-                if self.use_warp:
-                    import warp as wp
-                    from robosuite.utils.binding_utils import MjSimWarp
-                    assert isinstance(self.sim, MjSimWarp)
-                    _val = np.array([*obj_pos, *obj_quat], dtype=np.float32)
-                    self.sim.data.set_joint_qpos(
-                        obj.joints[0],
-                        wp.from_numpy(np.tile(_val, (self.num_envs, 1)), device=self.sim._warp_data.qpos.device),
-                    )
+                # See Coffee._reset_internal for the rationale: ``set_joint_qpos``
+                # does a full-row-range write, so sampling a single placement and
+                # tiling across envs would give every env the same placement
+                # *and* stomp kept envs under RobomimicVecEnv's slim masked reset.
+                # Instead, sample per-env fresh placements for just the rows in
+                # ``_reset_env_mask`` and write via indexed torch assign.
+                mask = getattr(self, "_reset_env_mask", None)
+                if mask is None:
+                    sample_idxs_arr = np.arange(self.num_envs)
+                elif isinstance(mask, torch.Tensor):
+                    sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
                 else:
-                    from robosuite.utils.binding_utils import MjSimWarp
-                    assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
+                    sample_idxs_arr = np.asarray(mask).nonzero()[0]
+
+                if sample_idxs_arr.size > 0:
+                    k = int(sample_idxs_arr.size)
+                    placements = self.placement_initializer.sample_batch(k)
+                    qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    row_idx = torch.as_tensor(
+                        sample_idxs_arr, device=qpos_t.device, dtype=torch.long
+                    )
+                    for obj_pos, obj_quat, obj in placements.values():
+                        addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
+                        start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                        stacked = np.concatenate(
+                            [obj_pos.astype(np.float32), obj_quat.astype(np.float32)], axis=-1
+                        )  # (k, 7)
+                        qpos_t[row_idx, start:end] = torch.as_tensor(
+                            stacked, device=qpos_t.device, dtype=torch.float32
+                        )
+            else:
+                assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
+                # Sample from the placement initializer for all objects
+                object_placements = self.placement_initializer.sample()
+
+                # Loop through all objects and reset their positions
+                for obj_pos, obj_quat, obj in object_placements.values():
                     self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
     def _setup_observables(self):
@@ -405,8 +423,13 @@ class Threading(SingleArmEnv_MG):
             # for conversion to relative gripper frame
             @sensor(modality=modality)
             def world_pose_in_gripper(obs_cache):
-                return T.pose_inv(T.pose2mat((obs_cache[f"{pf}eef_pos"], obs_cache[f"{pf}eef_quat"]))) if\
-                    f"{pf}eef_pos" in obs_cache and f"{pf}eef_quat" in obs_cache else np.eye(4)
+                if f"{pf}eef_pos" not in obs_cache or f"{pf}eef_quat" not in obs_cache:
+                    return np.eye(4)
+                eef_pos = obs_cache[f"{pf}eef_pos"]
+                eef_quat = obs_cache[f"{pf}eef_quat"]
+                if isinstance(self.sim, MjSimWarp):
+                    return T.pose_inv_torch(T.pose2mat_torch(eef_pos, eef_quat))  # (num_envs, 4, 4)
+                return T.pose_inv(T.pose2mat((eef_pos, eef_quat)))
             sensors = [world_pose_in_gripper]
             names = ["world_pose_in_gripper"]
             actives = [False]
@@ -448,11 +471,18 @@ class Threading(SingleArmEnv_MG):
 
         @sensor(modality=modality)
         def obj_pos(obs_cache):
-            return np.array(self.sim.data.body_xpos[self.obj_body_id[obj_name]])
+            bid = self.obj_body_id[obj_name]
+            if isinstance(self.sim, MjSimWarp):
+                return self.sim.data.body_xpos[bid]  # (num_envs, 3) torch.Tensor
+            return np.array(self.sim.data.body_xpos[bid])
 
         @sensor(modality=modality)
         def obj_quat(obs_cache):
-            return T.convert_quat(self.sim.data.body_xquat[self.obj_body_id[obj_name]], to="xyzw")
+            bid = self.obj_body_id[obj_name]
+            if isinstance(self.sim, MjSimWarp):
+                q = self.sim.data.body_xquat[bid]  # (num_envs, 4) wxyz torch.Tensor
+                return q[:, [1, 2, 3, 0]]  # (num_envs, 4) xyzw torch.Tensor
+            return T.convert_quat(self.sim.data.body_xquat[bid], to="xyzw")
 
         @sensor(modality=modality)
         def obj_to_eef_pos(obs_cache):
@@ -460,6 +490,14 @@ class Threading(SingleArmEnv_MG):
             if any([name not in obs_cache for name in
                     [f"{obj_name}_pos", f"{obj_name}_quat", "world_pose_in_gripper"]]):
                 return np.zeros(3)
+            if isinstance(self.sim, MjSimWarp):
+                obj_pos = obs_cache[f"{obj_name}_pos"]  # (num_envs, 3)
+                obj_quat = obs_cache[f"{obj_name}_quat"]  # (num_envs, 4) xyzw
+                world_poses = obs_cache["world_pose_in_gripper"]  # (num_envs, 4, 4)
+                obj_pose = T.pose2mat_torch(obj_pos, obj_quat)
+                rel_pose = world_poses @ obj_pose
+                obs_cache[f"{obj_name}_to_{pf}eef_quat"] = T.mat2quat_torch(rel_pose[:, :3, :3])
+                return rel_pose[:, :3, 3]
             obj_pose = T.pose2mat((obs_cache[f"{obj_name}_pos"], obs_cache[f"{obj_name}_quat"]))
             rel_pose = T.pose_in_A_to_pose_in_B(obj_pose, obs_cache["world_pose_in_gripper"])
             rel_pos, rel_quat = T.mat2pose(rel_pose)
@@ -468,8 +506,12 @@ class Threading(SingleArmEnv_MG):
 
         @sensor(modality=modality)
         def obj_to_eef_quat(obs_cache):
-            return obs_cache[f"{obj_name}_to_{pf}eef_quat"] if \
-                f"{obj_name}_to_{pf}eef_quat" in obs_cache else np.zeros(4)
+            key = f"{obj_name}_to_{pf}eef_quat"
+            if key in obs_cache:
+                return obs_cache[key]
+            if isinstance(self.sim, MjSimWarp):
+                return torch.zeros(self.sim.num_envs, 4, device="cuda")
+            return np.zeros(4)
 
         sensors = [obj_pos, obj_quat, obj_to_eef_pos, obj_to_eef_quat]
         names = [f"{obj_name}_pos", f"{obj_name}_quat", f"{obj_name}_to_{pf}eef_pos", f"{obj_name}_to_{pf}eef_quat"]
@@ -479,22 +521,32 @@ class Threading(SingleArmEnv_MG):
     def _check_success(self):
         """
         Check if needle has been inserted into ring.
+
+        Returns a Python bool for single-env sims and a ``(num_envs,)`` bool
+        torch tensor under warp.
         """
-        # needle_pos = np.array(self.sim.data.geom_xpos[self.sim.model.geom_name2id("needle_needle")])
-        needle_pos = np.array(self.sim.data.geom_xpos[self.sim.model.geom_name2id("needle_obj_needle")])
-
-        # ring position is average of all the surrounding ring geom positions
-        ring_pos = np.zeros(3)
-        for i in range(self.tripod.num_ring_geoms):
-            # ring_pos += np.array(self.sim.data.geom_xpos[self.sim.model.geom_name2id("tripod_ring_{}".format(i))])
-            ring_pos += np.array(self.sim.data.geom_xpos[self.sim.model.geom_name2id("tripod_obj_ring_{}".format(i))])
-        ring_pos /= self.tripod.num_ring_geoms
-
-        # radius should be the ring size, since we want to check that the bar is within the ring
+        needle_gid = self.sim.model.geom_name2id("needle_obj_needle")
+        ring_gids = [
+            self.sim.model.geom_name2id("tripod_obj_ring_{}".format(i))
+            for i in range(self.tripod.num_ring_geoms)
+        ]
         radius = self.tripod.ring_size[1]
 
-        # check if the center of the block and the hole are close enough
-        return (np.linalg.norm(needle_pos - ring_pos) < radius)
+        if isinstance(self.sim, MjSimWarp):
+            # geom_xpos is (num_envs, ngeom, 3) under warp.
+            needle_pos = self.sim.data.geom_xpos[needle_gid]  # (num_envs, 3)
+            ring_stack = torch.stack(
+                [self.sim.data.geom_xpos[g] for g in ring_gids], dim=0
+            )  # (n_ring, num_envs, 3)
+            ring_pos = ring_stack.mean(dim=0)  # (num_envs, 3)
+            return torch.linalg.norm(needle_pos - ring_pos, dim=-1) < radius
+
+        needle_pos = np.array(self.sim.data.geom_xpos[needle_gid])
+        ring_pos = np.zeros(3)
+        for gid in ring_gids:
+            ring_pos += np.array(self.sim.data.geom_xpos[gid])
+        ring_pos /= self.tripod.num_ring_geoms
+        return np.linalg.norm(needle_pos - ring_pos) < radius
 
     def visualize(self, vis_settings):
         """

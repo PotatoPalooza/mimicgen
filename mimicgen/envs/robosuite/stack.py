@@ -2,8 +2,16 @@
 #
 # Licensed under the NVIDIA Source Code License [see LICENSE for details].
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import warp as wp
+
 from collections import OrderedDict
 import numpy as np
+import torch
 
 from robosuite.utils.transform_utils import convert_quat
 from robosuite.utils.mjcf_utils import CustomMaterial, find_elements, string_to_array
@@ -12,6 +20,7 @@ from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
 from robosuite.models.arenas import TableArena
 from robosuite.models.objects import BoxObject
 from robosuite.models.tasks import ManipulationTask
+from robosuite.utils.binding_utils import MjSimWarp
 from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.utils.observables import Observable, sensor
 from robosuite.environments.manipulation.stack import Stack
@@ -25,6 +34,11 @@ class Stack_D0(Stack, SingleArmEnv_MG):
     """
     def __init__(self, **kwargs):
         assert "placement_initializer" not in kwargs, "this class defines its own placement initializer"
+
+        # Gated fall-off early termination: any tracked cube dropping below
+        # table_offset[2] - fall_off_z_margin triggers a per-env early term.
+        self.fall_off_termination = bool(kwargs.pop("fall_off_termination", False))
+        self.fall_off_z_margin = float(kwargs.pop("fall_off_z_margin", 0.1))
 
         bounds = self._get_initial_placement_bounds()
 
@@ -51,25 +65,176 @@ class Stack_D0(Stack, SingleArmEnv_MG):
         # make sure we don't get a conflict for function implementation
         return SingleArmEnv_MG.edit_model_xml(self, xml_str)
 
-    def reward(self, action=None):
+    # ------------------------------------------------------------------
+    # References / geom-id caches for warp contact-group queries
+    # ------------------------------------------------------------------
+
+    def _setup_references(self):
+        super()._setup_references()
+
+        gripper = self.robots[0].gripper
+        self.cubeA_contact_geom_ids = [
+            self.sim.model.geom_name2id(g) for g in self.cubeA.contact_geoms
+        ]
+        self.cubeB_contact_geom_ids = [
+            self.sim.model.geom_name2id(g) for g in self.cubeB.contact_geoms
+        ]
+        self.left_fingerpad_geom_ids = [
+            self.sim.model.geom_name2id(g) for g in gripper.important_geoms["left_fingerpad"]
+        ]
+        self.right_fingerpad_geom_ids = [
+            self.sim.model.geom_name2id(g) for g in gripper.important_geoms["right_fingerpad"]
+        ]
+
+    # ------------------------------------------------------------------
+    # Reset
+    # ------------------------------------------------------------------
+
+    def _reset_internal(self):
+        """Mask-aware per-env placement sampling + qpos writes under warp.
+
+        Bypasses upstream ``Stack._reset_internal`` (full-batch tile write)
+        so kept envs' cube qpos flows through untouched during partial
+        resets.
+        """
+        SingleArmEnv._reset_internal(self)
+
+        if self.deterministic_reset:
+            return
+
+        if self.use_warp:
+            import warp as wp
+
+            assert isinstance(self.sim, MjSimWarp)
+
+            mask = getattr(self, "_reset_env_mask", None)
+            if mask is None:
+                sample_idxs_arr = np.arange(self.num_envs)
+            elif isinstance(mask, torch.Tensor):
+                sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
+            else:
+                sample_idxs_arr = np.asarray(mask).nonzero()[0]
+
+            if sample_idxs_arr.size == 0:
+                return
+
+            k = int(sample_idxs_arr.size)
+            placements = self.placement_initializer.sample_batch(k)
+            qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+            row_idx = torch.as_tensor(
+                sample_idxs_arr, device=qpos_t.device, dtype=torch.long
+            )
+            for obj_pos, obj_quat, obj in placements.values():
+                addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
+                start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                stacked = np.concatenate(
+                    [obj_pos.astype(np.float32), obj_quat.astype(np.float32)], axis=-1
+                )
+                qpos_t[row_idx, start:end] = torch.as_tensor(
+                    stacked, device=qpos_t.device, dtype=torch.float32
+                )
+            return
+
+        object_placements = self.placement_initializer.sample()
+        for obj_pos, obj_quat, obj in object_placements.values():
+            self.sim.data.set_joint_qpos(
+                obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)])
+            )
+
+    # ------------------------------------------------------------------
+    # Reward / success
+    # ------------------------------------------------------------------
+
+    def reward(self, action: np.ndarray | wp.array | None = None) -> float | torch.Tensor:
+        """Sparse reward (``2.0 * reward_scale / 2.0 = reward_scale`` on stack).
+
+        Warp path returns ``(num_envs,)`` float tensor; CPU path delegates to
+        upstream ``Stack.reward`` (supports shaped rewards).
+        """
+        if isinstance(self.sim, MjSimWarp):
+            r_stack = self._check_cubeA_stacked()
+            reward = r_stack.float() * 2.0
+            if self.reward_scale is not None:
+                reward = reward * (self.reward_scale / 2.0)
+            return reward
         return Stack.reward(self, action=action)
 
+    def _check_success(self):
+        """Under warp, upstream ``Stack._check_success`` goes through the
+        scalar ``staged_rewards`` path which is CPU-only. Short-circuit to
+        the same predicate the sparse reward uses.
+        """
+        stacked = self._check_cubeA_stacked()
+        if isinstance(stacked, torch.Tensor):
+            return stacked
+        return bool(stacked)
+
     def _check_lifted(self, body_id, margin=0.04):
-        # lifting is successful when the cube is above the table top by a margin
+        """Cube-above-table check. Returns ``(N,)`` bool tensor under warp,
+        scalar bool under CPU.
+        """
+        if isinstance(self.sim, MjSimWarp):
+            body_pos = self.sim.data.body_xpos[body_id]  # (N, 3)
+            return body_pos[..., 2] > (float(self.table_offset[2]) + float(margin))
         body_pos = self.sim.data.body_xpos[body_id]
-        body_height = body_pos[2]
-        table_height = self.table_offset[2]
-        body_lifted = body_height > table_height + margin
-        return body_lifted
+        return body_pos[2] > (self.table_offset[2] + margin)
+
+    def _check_cubeA_grasped(self):
+        """Robot grasping cubeA: contact on both fingerpads (warp) / CPU
+        ``_check_grasp`` (no-warp).
+        """
+        if isinstance(self.sim, MjSimWarp):
+            left_hit = self.sim.check_contact_groups(
+                self.left_fingerpad_geom_ids, self.cubeA_contact_geom_ids
+            )
+            right_hit = self.sim.check_contact_groups(
+                self.right_fingerpad_geom_ids, self.cubeA_contact_geom_ids
+            )
+            return left_hit & right_hit
+        return self._check_grasp(gripper=self.robots[0].gripper, object_geoms=self.cubeA)
 
     def _check_cubeA_lifted(self):
         return self._check_lifted(self.cubeA_body_id, margin=0.04)
 
     def _check_cubeA_stacked(self):
+        if isinstance(self.sim, MjSimWarp):
+            grasping = self._check_cubeA_grasped()  # (N,) bool
+            lifted = self._check_cubeA_lifted()  # (N,) bool
+            touching = self.sim.check_contact_groups(
+                self.cubeA_contact_geom_ids, self.cubeB_contact_geom_ids
+            )  # (N,) bool
+            return (~grasping) & lifted & touching
         grasping_cubeA = self._check_grasp(gripper=self.robots[0].gripper, object_geoms=self.cubeA)
         cubeA_lifted = self._check_cubeA_lifted()
         cubeA_touching_cubeB = self.check_contact(self.cubeA, self.cubeB)
         return (not grasping_cubeA) and cubeA_lifted and cubeA_touching_cubeB
+
+    # ------------------------------------------------------------------
+    # Early-termination hook
+    # ------------------------------------------------------------------
+
+    def _fall_off_tracked_objects(self) -> tuple[str, ...]:
+        return ("cubeA", "cubeB")
+
+    def _fall_off_body_id(self, obj_name: str):
+        return {"cubeA": self.cubeA_body_id, "cubeB": self.cubeB_body_id}.get(obj_name)
+
+    def _check_early_termination(self):
+        extras = super()._check_early_termination()
+        if not self.fall_off_termination:
+            return extras
+        threshold = float(self.table_offset[2]) - float(self.fall_off_z_margin)
+        for obj_name in self._fall_off_tracked_objects():
+            bid = self._fall_off_body_id(obj_name)
+            if bid is None:
+                continue
+            pos = self.sim.data.body_xpos[bid]
+            extras[f"fell_off_{obj_name}"] = pos[..., 2] < threshold
+        return extras
+
+    # ------------------------------------------------------------------
+    # Arena / model / observables
+    # ------------------------------------------------------------------
 
     def _load_arena(self):
         """
@@ -166,6 +331,84 @@ class Stack_D0(Stack, SingleArmEnv_MG):
             mujoco_objects=cubes,
         )
 
+    def _setup_observables(self):
+        """Rebuild observables with warp-aware sensors. Under warp, pos /
+        quat / relative sensors return ``(N, 3)`` / ``(N, 4)`` torch tensors.
+        """
+        # Skip upstream Stack._setup_observables (CPU-only sensors); rebuild
+        # from the SingleArmEnv base and append warp-aware object sensors.
+        observables = SingleArmEnv._setup_observables(self)
+
+        if not self.use_object_obs:
+            return observables
+
+        pf = self.robots[0].robot_model.naming_prefix
+        modality = "object"
+        warp = isinstance(self.sim, MjSimWarp)
+
+        def _zeros(shape):
+            if warp:
+                return torch.zeros(
+                    self.num_envs, shape, dtype=torch.float32, device="cuda"
+                )
+            return np.zeros(shape)
+
+        @sensor(modality=modality)
+        def cubeA_pos(obs_cache):
+            if warp:
+                return self.sim.data.body_xpos[self.cubeA_body_id]  # (N, 3)
+            return np.array(self.sim.data.body_xpos[self.cubeA_body_id])
+
+        @sensor(modality=modality)
+        def cubeA_quat(obs_cache):
+            if warp:
+                q = self.sim.data.body_xquat[self.cubeA_body_id]  # (N, 4) wxyz
+                return q[..., [1, 2, 3, 0]]
+            return convert_quat(np.array(self.sim.data.body_xquat[self.cubeA_body_id]), to="xyzw")
+
+        @sensor(modality=modality)
+        def cubeB_pos(obs_cache):
+            if warp:
+                return self.sim.data.body_xpos[self.cubeB_body_id]
+            return np.array(self.sim.data.body_xpos[self.cubeB_body_id])
+
+        @sensor(modality=modality)
+        def cubeB_quat(obs_cache):
+            if warp:
+                q = self.sim.data.body_xquat[self.cubeB_body_id]
+                return q[..., [1, 2, 3, 0]]
+            return convert_quat(np.array(self.sim.data.body_xquat[self.cubeB_body_id]), to="xyzw")
+
+        @sensor(modality=modality)
+        def gripper_to_cubeA(obs_cache):
+            if "cubeA_pos" in obs_cache and f"{pf}eef_pos" in obs_cache:
+                return obs_cache["cubeA_pos"] - obs_cache[f"{pf}eef_pos"]
+            return _zeros(3)
+
+        @sensor(modality=modality)
+        def gripper_to_cubeB(obs_cache):
+            if "cubeB_pos" in obs_cache and f"{pf}eef_pos" in obs_cache:
+                return obs_cache["cubeB_pos"] - obs_cache[f"{pf}eef_pos"]
+            return _zeros(3)
+
+        @sensor(modality=modality)
+        def cubeA_to_cubeB(obs_cache):
+            if "cubeA_pos" in obs_cache and "cubeB_pos" in obs_cache:
+                return obs_cache["cubeB_pos"] - obs_cache["cubeA_pos"]
+            return _zeros(3)
+
+        sensors = [cubeA_pos, cubeA_quat, cubeB_pos, cubeB_quat, gripper_to_cubeA, gripper_to_cubeB, cubeA_to_cubeB]
+        names = [s.__name__ for s in sensors]
+
+        for name, s in zip(names, sensors):
+            observables[name] = Observable(
+                name=name,
+                sensor=s,
+                sampling_rate=self.control_freq,
+            )
+
+        return observables
+
     def _get_initial_placement_bounds(self):
         """
         Internal function to get bounds for randomization of initial placements of objects (e.g.
@@ -177,7 +420,7 @@ class Stack_D0(Stack, SingleArmEnv_MG):
                 z_rot: 2-tuple for low and high values for uniform sampling of z-rotation
                 reference: np array of shape (3,) for reference position in world frame (assumed to be static and not change)
         """
-        return { 
+        return {
             k : dict(
                 x=(-0.08, 0.08),
                 y=(-0.08, 0.08),
@@ -219,7 +462,7 @@ class Stack_D1(Stack_D0):
 
     def _get_initial_placement_bounds(self):
         max_dim = 0.20
-        return { 
+        return {
             k : dict(
                 x=(-max_dim, max_dim),
                 y=(-max_dim, max_dim),
@@ -237,6 +480,9 @@ class StackThree(Stack_D0):
     """
     def __init__(self, **kwargs):
         assert "placement_initializer" not in kwargs, "this class defines its own placement initializer"
+
+        self.fall_off_termination = bool(kwargs.pop("fall_off_termination", False))
+        self.fall_off_z_margin = float(kwargs.pop("fall_off_z_margin", 0.1))
 
         bounds = self._get_initial_placement_bounds()
 
@@ -260,53 +506,69 @@ class StackThree(Stack_D0):
 
         Stack.__init__(self, placement_initializer=placement_initializer, **kwargs)
 
+    # ------------------------------------------------------------------
+    # Reward / success
+    # ------------------------------------------------------------------
+
     def reward(self, action=None):
-        """
-        We only return sparse rewards here.
-        """
-        reward = 0.
-
-        # sparse completion reward
-        if self._check_success():
-            reward = 1.0
-
-        # Scale reward if requested
+        """Sparse reward scaled by ``reward_scale`` (warp: ``(N,)`` float)."""
+        success = self._check_success()
+        if isinstance(success, torch.Tensor):
+            reward = success.float()
+            if self.reward_scale is not None:
+                reward = reward * self.reward_scale
+            return reward
+        reward = 1.0 if success else 0.0
         if self.reward_scale is not None:
             reward *= self.reward_scale
-
         return reward
+
+    def _check_success(self):
+        a_stacked = self._check_cubeA_stacked()
+        c_stacked = self._check_cubeC_stacked()
+        if isinstance(a_stacked, torch.Tensor) or isinstance(c_stacked, torch.Tensor):
+            return a_stacked & c_stacked
+        return bool(a_stacked) and bool(c_stacked)
 
     def _check_cubeC_lifted(self):
         # cube C needs to be higher than A
         return self._check_lifted(self.cubeC_body_id, margin=0.08)
 
+    def _check_cubeC_grasped(self):
+        if isinstance(self.sim, MjSimWarp):
+            left_hit = self.sim.check_contact_groups(
+                self.left_fingerpad_geom_ids, self.cubeC_contact_geom_ids
+            )
+            right_hit = self.sim.check_contact_groups(
+                self.right_fingerpad_geom_ids, self.cubeC_contact_geom_ids
+            )
+            return left_hit & right_hit
+        return self._check_grasp(gripper=self.robots[0].gripper, object_geoms=self.cubeC)
+
     def _check_cubeC_stacked(self):
+        if isinstance(self.sim, MjSimWarp):
+            grasping = self._check_cubeC_grasped()  # (N,) bool
+            lifted = self._check_cubeC_lifted()  # (N,) bool
+            touching = self.sim.check_contact_groups(
+                self.cubeC_contact_geom_ids, self.cubeA_contact_geom_ids
+            )
+            return (~grasping) & lifted & touching
         grasping_cubeC = self._check_grasp(gripper=self.robots[0].gripper, object_geoms=self.cubeC)
         cubeC_lifted = self._check_cubeC_lifted()
         cubeC_touching_cubeA = self.check_contact(self.cubeC, self.cubeA)
         return (not grasping_cubeC) and cubeC_lifted and cubeC_touching_cubeA
 
     def staged_rewards(self):
+        """Placeholder staged rewards. Only the terminal ``r_stack`` component
+        is populated — all three cubes stacked correctly. Warp path returns a
+        ``(N,)`` float tensor; CPU returns a float.
         """
-        Helper function to calculate staged rewards based on current physical states.
-        Returns:
-            3-tuple:
-                - (float): reward for reaching and grasping
-                - (float): reward for lifting and aligning
-                - (float): reward for stacking
-        """
-        # Stacking successful when A is on top of B and C is on top of A.
-        # This means both A and C are lifted, not grasped by robot, and we have contact
-        # between (A, B) and (A, C).
-
-        # stacking is successful when the block is lifted and the gripper is not holding the object
-        r_reach = 0.
-        r_lift = 0.
-        r_stack = 0.
-        if self._check_cubeA_stacked() and self._check_cubeC_stacked():
-            r_stack = 1.0
-
-        return r_reach, r_lift, r_stack
+        stacked = self._check_success()
+        if isinstance(stacked, torch.Tensor):
+            r_stack = stacked.float()
+            zero = torch.zeros_like(r_stack)
+            return zero, zero, r_stack
+        return 0.0, 0.0, (1.0 if stacked else 0.0)
 
     def _load_arena(self):
         """
@@ -425,57 +687,84 @@ class StackThree(Stack_D0):
 
         # Additional object references from this env
         self.cubeC_body_id = self.sim.model.body_name2id(self.cubeC.root_body)
+        self.cubeC_contact_geom_ids = [
+            self.sim.model.geom_name2id(g) for g in self.cubeC.contact_geoms
+        ]
 
     def _setup_observables(self):
-        """
-        Sets up observables to be used for this environment. Creates object-based observables if enabled
-        Returns:
-            OrderedDict: Dictionary mapping observable names to its corresponding Observable object
-        """
+        """Appends cubeC sensors (warp-aware) to the parent's observables."""
         observables = super()._setup_observables()
 
-        # low-level object information
-        if self.use_object_obs:
-            # Get robot prefix and define observables modality
-            pf = self.robots[0].robot_model.naming_prefix
-            modality = "object"
+        if not self.use_object_obs:
+            return observables
 
-            # position and rotation of the first cube
-            @sensor(modality=modality)
-            def cubeC_pos(obs_cache):
-                return np.array(self.sim.data.body_xpos[self.cubeC_body_id])
+        pf = self.robots[0].robot_model.naming_prefix
+        modality = "object"
+        warp = isinstance(self.sim, MjSimWarp)
 
-            @sensor(modality=modality)
-            def cubeC_quat(obs_cache):
-                return convert_quat(np.array(self.sim.data.body_xquat[self.cubeC_body_id]), to="xyzw")
-
-            @sensor(modality=modality)
-            def gripper_to_cubeC(obs_cache):
-                return obs_cache["cubeC_pos"] - obs_cache[f"{pf}eef_pos"] if \
-                    "cubeC_pos" in obs_cache and f"{pf}eef_pos" in obs_cache else np.zeros(3)
-
-            @sensor(modality=modality)
-            def cubeA_to_cubeC(obs_cache):
-                return obs_cache["cubeC_pos"] - obs_cache["cubeA_pos"] if \
-                    "cubeA_pos" in obs_cache and "cubeC_pos" in obs_cache else np.zeros(3)
-
-            @sensor(modality=modality)
-            def cubeB_to_cubeC(obs_cache):
-                return obs_cache["cubeB_pos"] - obs_cache["cubeC_pos"] if \
-                    "cubeB_pos" in obs_cache and "cubeC_pos" in obs_cache else np.zeros(3)
-
-            sensors = [cubeC_pos, cubeC_quat, gripper_to_cubeC, cubeA_to_cubeC, cubeB_to_cubeC]
-            names = [s.__name__ for s in sensors]
-
-            # Create observables
-            for name, s in zip(names, sensors):
-                observables[name] = Observable(
-                    name=name,
-                    sensor=s,
-                    sampling_rate=self.control_freq,
+        def _zeros(shape):
+            if warp:
+                return torch.zeros(
+                    self.num_envs, shape, dtype=torch.float32, device="cuda"
                 )
+            return np.zeros(shape)
+
+        @sensor(modality=modality)
+        def cubeC_pos(obs_cache):
+            if warp:
+                return self.sim.data.body_xpos[self.cubeC_body_id]
+            return np.array(self.sim.data.body_xpos[self.cubeC_body_id])
+
+        @sensor(modality=modality)
+        def cubeC_quat(obs_cache):
+            if warp:
+                q = self.sim.data.body_xquat[self.cubeC_body_id]
+                return q[..., [1, 2, 3, 0]]
+            return convert_quat(np.array(self.sim.data.body_xquat[self.cubeC_body_id]), to="xyzw")
+
+        @sensor(modality=modality)
+        def gripper_to_cubeC(obs_cache):
+            if "cubeC_pos" in obs_cache and f"{pf}eef_pos" in obs_cache:
+                return obs_cache["cubeC_pos"] - obs_cache[f"{pf}eef_pos"]
+            return _zeros(3)
+
+        @sensor(modality=modality)
+        def cubeA_to_cubeC(obs_cache):
+            if "cubeA_pos" in obs_cache and "cubeC_pos" in obs_cache:
+                return obs_cache["cubeC_pos"] - obs_cache["cubeA_pos"]
+            return _zeros(3)
+
+        @sensor(modality=modality)
+        def cubeB_to_cubeC(obs_cache):
+            if "cubeB_pos" in obs_cache and "cubeC_pos" in obs_cache:
+                return obs_cache["cubeB_pos"] - obs_cache["cubeC_pos"]
+            return _zeros(3)
+
+        sensors = [cubeC_pos, cubeC_quat, gripper_to_cubeC, cubeA_to_cubeC, cubeB_to_cubeC]
+        names = [s.__name__ for s in sensors]
+
+        for name, s in zip(names, sensors):
+            observables[name] = Observable(
+                name=name,
+                sensor=s,
+                sampling_rate=self.control_freq,
+            )
 
         return observables
+
+    # ------------------------------------------------------------------
+    # Early-termination hook
+    # ------------------------------------------------------------------
+
+    def _fall_off_tracked_objects(self) -> tuple[str, ...]:
+        return ("cubeA", "cubeB", "cubeC")
+
+    def _fall_off_body_id(self, obj_name: str):
+        return {
+            "cubeA": self.cubeA_body_id,
+            "cubeB": self.cubeB_body_id,
+            "cubeC": self.cubeC_body_id,
+        }.get(obj_name)
 
     def _get_initial_placement_bounds(self):
         """
@@ -488,7 +777,7 @@ class StackThree(Stack_D0):
                 z_rot: 2-tuple for low and high values for uniform sampling of z-rotation
                 reference: np array of shape (3,) for reference position in world frame (assumed to be static and not change)
         """
-        return { 
+        return {
             k : dict(
                 x=(-0.10, 0.10),
                 y=(-0.10, 0.10),
@@ -535,7 +824,7 @@ class StackThree_D1(StackThree_D0):
 
     def _get_initial_placement_bounds(self):
         max_dim = 0.20
-        return { 
+        return {
             k : dict(
                 x=(-max_dim, max_dim),
                 y=(-max_dim, max_dim),
