@@ -180,21 +180,43 @@ class Square_D1(Square_D0):
                     peg1_pos_np = self.sim.data.body_xpos[peg1_id].cpu().numpy()[0]  # pegs fixed across envs
                     peg2_pos_np = self.sim.data.body_xpos[peg2_id].cpu().numpy()[0]
 
-                    placements = None
+                    # Per-env rejection: only resample rows that are still
+                    # invalid. Batch-wide reject-all fails for k>>1 since
+                    # all-envs-valid probability is (1-p)^k.
+                    pending = np.ones(k, dtype=bool)
+                    placements: dict | None = None
                     for _ in range(5000):
-                        placements = self.placement_initializer.sample_batch(k)
-                        location_valid = np.ones(k, dtype=bool)
-                        for obj_pos, obj_quat, obj in placements.values():
+                        n_pending = int(pending.sum())
+                        if n_pending == 0:
+                            break
+                        batch = self.placement_initializer.sample_batch(n_pending)
+                        row_valid = np.ones(n_pending, dtype=bool)
+                        for obj_pos, obj_quat, obj in batch.values():
                             horizontal_radius = obj.horizontal_radius
                             d1 = np.linalg.norm(obj_pos[:, :2] - peg1_pos_np[:2], axis=-1)
-                            location_valid &= d1 > (self.peg1_horizontal_radius + horizontal_radius)
+                            row_valid &= d1 > (self.peg1_horizontal_radius + horizontal_radius)
                             d2 = np.linalg.norm(obj_pos[:, :2] - peg2_pos_np[:2], axis=-1)
-                            location_valid &= d2 > (self.peg2_horizontal_radius + horizontal_radius)
-                        if location_valid.all():
-                            break
-                    else:
+                            row_valid &= d2 > (self.peg2_horizontal_radius + horizontal_radius)
+
+                        if placements is None:
+                            placements = {
+                                name: (
+                                    np.zeros((k,) + obj_pos.shape[1:], dtype=obj_pos.dtype),
+                                    np.zeros((k,) + obj_quat.shape[1:], dtype=obj_quat.dtype),
+                                    obj,
+                                )
+                                for name, (obj_pos, obj_quat, obj) in batch.items()
+                            }
+                        pending_idx = np.nonzero(pending)[0]
+                        batch_valid_idx = np.nonzero(row_valid)[0]
+                        target_idx = pending_idx[batch_valid_idx]
+                        for name, (obj_pos, obj_quat, _) in batch.items():
+                            placements[name][0][target_idx] = obj_pos[batch_valid_idx]
+                            placements[name][1][target_idx] = obj_quat[batch_valid_idx]
+                        pending[target_idx] = False
+                    if pending.any():
                         raise RandomizationError(
-                            f"Cannot place all objects for {int((~location_valid).sum())}/{k} envs"
+                            f"Cannot place all objects for {int(pending.sum())}/{k} envs"
                         )
 
                     qpos_t = wp.to_torch(self.sim._warp_data.qpos)

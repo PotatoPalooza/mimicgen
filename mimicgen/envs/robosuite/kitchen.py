@@ -318,12 +318,18 @@ class Kitchen_D0(KitchenEnv, SingleArmEnv_MG):
         under warp (visual only; not in the warp model snapshot).
         """
         if isinstance(self.sim, MjSimWarp):
+            # visualize() calls _post_process() inside env.reset() before
+            # _init_stove_state_tracking() has populated buttons_on/
+            # button_qpos_addrs — silently skip in that window.
+            if not getattr(self, "button_qpos_addrs", None):
+                return
             for i in range(1, self.num_stoves + 1):
                 qpos = self.sim.data.qpos[self.button_qpos_addrs[i]]  # (N,)
-                if not isinstance(self.buttons_on[i], torch.Tensor):
+                prev = self.buttons_on.get(i) if isinstance(self.buttons_on, dict) else None
+                if not isinstance(prev, torch.Tensor):
                     self.buttons_on[i] = (qpos >= 0.0)
                 else:
-                    self.buttons_on[i].copy_(qpos >= 0.0)
+                    prev.copy_(qpos >= 0.0)
             return
         return KitchenEnv._post_process(self)
 
