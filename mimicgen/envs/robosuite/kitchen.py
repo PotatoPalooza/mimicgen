@@ -101,7 +101,7 @@ class Kitchen_D0(KitchenEnv, SingleArmEnv_MG):
         self.fall_off_z_margin = fall_off_z_margin
         KitchenEnv.__init__(self, **kwargs)
 
-        # some additional variables for better success check — allocated
+        # some additional variables for better success check -- allocated
         # after the base init so the warp path can read self.sim.
         self._init_stove_state_tracking()
 
@@ -109,14 +109,10 @@ class Kitchen_D0(KitchenEnv, SingleArmEnv_MG):
         # make sure we don't get a conflict for function implementation
         return SingleArmEnv_MG.edit_model_xml(self, xml_str)
 
-    # ------------------------------------------------------------------
-    # Per-env state tracking for buttons / stove latches
-    # ------------------------------------------------------------------
-
     @property
     def _has_gripper_contact(self):
         """Upstream reads ``robots[0].ee_force`` which is not wired
-        through warp — return per-env zero under warp.
+        through warp -- return per-env zero under warp.
         """
         if isinstance(self.sim, MjSimWarp):
             return torch.zeros(self.num_envs, 1, dtype=torch.float32, device="cuda")
@@ -312,15 +308,13 @@ class Kitchen_D0(KitchenEnv, SingleArmEnv_MG):
         """Per-env button state update.
 
         Under warp reads the button qpos tensor and sets
-        ``buttons_on[i]`` directly — the scalar upstream latch logic is
+        ``buttons_on[i]`` directly -- the scalar upstream latch logic is
         replaced with ``buttons_on = (qpos >= 0)``, which is equivalent
         (see upstream _post_process). Site visibility is not updated
         under warp (visual only; not in the warp model snapshot).
         """
         if isinstance(self.sim, MjSimWarp):
-            # visualize() calls _post_process() inside env.reset() before
-            # _init_stove_state_tracking() has populated buttons_on/
-            # button_qpos_addrs — silently skip in that window.
+            # visualize() fires _post_process pre-_init_stove_state_tracking; skip if unpopulated.
             if not getattr(self, "button_qpos_addrs", None):
                 return
             for i in range(1, self.num_stoves + 1):
@@ -341,19 +335,11 @@ class Kitchen_D0(KitchenEnv, SingleArmEnv_MG):
         self._post_process()
         return KitchenEnv._get_observations(self, force_update=force_update)
 
-    # ------------------------------------------------------------------
-    # Early-termination hook
-    # ------------------------------------------------------------------
-
     def _fall_off_tracked_objects(self) -> tuple[str, ...]:
         return ("pot", "bread")
 
-    def _check_early_termination(self):
-        """Terminate envs where the pot or bread drops below the table top.
-
-        Threshold is ``table_offset[2] - fall_off_z_margin``
-        (KitchenEnv uses ``table_offset[2] = 0.90`` hardcoded).
-        """
+    def _check_early_termination(self) -> dict[str, object]:
+        """Pot/bread fall-off causes (table_offset[2]=0.90 - fall_off_z_margin)."""
         try:
             extras = super()._check_early_termination()
         except AttributeError:
@@ -415,7 +401,7 @@ class Kitchen_D1(Kitchen_D0):
                     )
                     for obj_pos, obj_quat, obj in placements.values():
                         if obj.name in self._hardcoded_z_offsets:
-                            # Fixture — no free joint; warp model snapshot.
+                            # Fixture -- no free joint; warp model snapshot.
                             continue
                         addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
                         start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
@@ -445,7 +431,7 @@ class Kitchen_D1(Kitchen_D0):
         self._history_force_torque = RingBuffer(dim=6, length=16)
         self._recent_force_torque = []
 
-        # Reset stove/button latches (mask-aware under warp — see
+        # Reset stove/button latches (mask-aware under warp -- see
         # Kitchen_D0._reset_internal for the masked tensor path).
         if isinstance(self.sim, MjSimWarp):
             if not isinstance(self.has_stove_turned_on, torch.Tensor):

@@ -181,9 +181,7 @@ class ThreePieceAssembly(SingleArmEnv_MG):
         fall_off_termination: bool = False,
         fall_off_z_margin: float = 0.1,
     ):
-        # Early-termination when any tracked piece drops below
-        # ``table_offset[2] - fall_off_z_margin``. Gated so BC eval /
-        # demo-gen keep the no-termination behaviour unless opted in.
+        # Fall-off early-term (gated; BC/demo-gen default off). Threshold = table_offset[2] - fall_off_z_margin.
         self.fall_off_termination = fall_off_termination
         self.fall_off_z_margin = fall_off_z_margin
 
@@ -888,10 +886,7 @@ class ThreePieceAssembly(SingleArmEnv_MG):
 
     def _check_first_piece_is_assembled(self, xy_thresh=0.02):
         if isinstance(self.sim, MjSimWarp):
-            # Under warp, `_check_grasp` is CPU-only and silently returns
-            # False — mirror the fingerpad-contact pattern Coffee uses.
-            # `piece_1` has many contact geoms; checking any fingerpad
-            # contact is a reasonable proxy for "robot is holding it".
+            # Fingerpad-contact proxy for grasp (CPU _check_grasp no-ops under warp).
             left_hit = self.sim.check_contact_groups(
                 self.left_fingerpad_geom_ids, self.piece_1_contact_geom_ids
             )
@@ -956,15 +951,11 @@ class ThreePieceAssembly(SingleArmEnv_MG):
             (np.abs(piece_2_pos[2] - z_correct) < z_thresh) and (not robot_and_piece_2_in_contact)
         return second_piece_is_assembled
 
-    # ------------------------------------------------------------------
-    # Early-termination hook
-    # ------------------------------------------------------------------
-
     def _fall_off_tracked_objects(self) -> tuple[str, ...]:
         return ("piece_1", "piece_2", "base")
 
-    def _check_early_termination(self):
-        """Terminate envs where any tracked piece drops below the table top."""
+    def _check_early_termination(self) -> dict[str, object]:
+        """Fall-off cause per tracked piece below table threshold."""
         try:
             extras = super()._check_early_termination()
         except AttributeError:

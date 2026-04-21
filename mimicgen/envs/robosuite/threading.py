@@ -366,12 +366,7 @@ class Threading(SingleArmEnv_MG):
 
                 assert isinstance(self.sim, MjSimWarp)
 
-                # See Coffee._reset_internal for the rationale: ``set_joint_qpos``
-                # does a full-row-range write, so sampling a single placement and
-                # tiling across envs would give every env the same placement
-                # *and* stomp kept envs under RobomimicVecEnv's slim masked reset.
-                # Instead, sample per-env fresh placements for just the rows in
-                # ``_reset_env_mask`` and write via indexed torch assign.
+                # Masked per-env placement (see Coffee._reset_internal): full-row writes would tile + clobber kept rows.
                 mask = getattr(self, "_reset_env_mask", None)
                 if mask is None:
                     sample_idxs_arr = np.arange(self.num_envs)

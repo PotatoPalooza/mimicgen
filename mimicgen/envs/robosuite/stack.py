@@ -65,10 +65,6 @@ class Stack_D0(Stack, SingleArmEnv_MG):
         # make sure we don't get a conflict for function implementation
         return SingleArmEnv_MG.edit_model_xml(self, xml_str)
 
-    # ------------------------------------------------------------------
-    # References / geom-id caches for warp contact-group queries
-    # ------------------------------------------------------------------
-
     def _setup_references(self):
         super()._setup_references()
 
@@ -85,10 +81,6 @@ class Stack_D0(Stack, SingleArmEnv_MG):
         self.right_fingerpad_geom_ids = [
             self.sim.model.geom_name2id(g) for g in gripper.important_geoms["right_fingerpad"]
         ]
-
-    # ------------------------------------------------------------------
-    # Reset
-    # ------------------------------------------------------------------
 
     def _reset_internal(self):
         """Mask-aware per-env placement sampling + qpos writes under warp.
@@ -140,10 +132,6 @@ class Stack_D0(Stack, SingleArmEnv_MG):
             self.sim.data.set_joint_qpos(
                 obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)])
             )
-
-    # ------------------------------------------------------------------
-    # Reward / success
-    # ------------------------------------------------------------------
 
     def reward(self, action: np.ndarray | wp.array | None = None) -> float | torch.Tensor:
         """Sparse reward (``2.0 * reward_scale / 2.0 = reward_scale`` on stack).
@@ -209,17 +197,13 @@ class Stack_D0(Stack, SingleArmEnv_MG):
         cubeA_touching_cubeB = self.check_contact(self.cubeA, self.cubeB)
         return (not grasping_cubeA) and cubeA_lifted and cubeA_touching_cubeB
 
-    # ------------------------------------------------------------------
-    # Early-termination hook
-    # ------------------------------------------------------------------
-
     def _fall_off_tracked_objects(self) -> tuple[str, ...]:
         return ("cubeA", "cubeB")
 
     def _fall_off_body_id(self, obj_name: str):
         return {"cubeA": self.cubeA_body_id, "cubeB": self.cubeB_body_id}.get(obj_name)
 
-    def _check_early_termination(self):
+    def _check_early_termination(self) -> dict[str, object]:
         extras = super()._check_early_termination()
         if not self.fall_off_termination:
             return extras
@@ -231,10 +215,6 @@ class Stack_D0(Stack, SingleArmEnv_MG):
             pos = self.sim.data.body_xpos[bid]
             extras[f"fell_off_{obj_name}"] = pos[..., 2] < threshold
         return extras
-
-    # ------------------------------------------------------------------
-    # Arena / model / observables
-    # ------------------------------------------------------------------
 
     def _load_arena(self):
         """
@@ -506,10 +486,6 @@ class StackThree(Stack_D0):
 
         Stack.__init__(self, placement_initializer=placement_initializer, **kwargs)
 
-    # ------------------------------------------------------------------
-    # Reward / success
-    # ------------------------------------------------------------------
-
     def reward(self, action=None):
         """Sparse reward scaled by ``reward_scale`` (warp: ``(N,)`` float)."""
         success = self._check_success()
@@ -560,7 +536,7 @@ class StackThree(Stack_D0):
 
     def staged_rewards(self):
         """Placeholder staged rewards. Only the terminal ``r_stack`` component
-        is populated — all three cubes stacked correctly. Warp path returns a
+        is populated -- all three cubes stacked correctly. Warp path returns a
         ``(N,)`` float tensor; CPU returns a float.
         """
         stacked = self._check_success()
@@ -751,10 +727,6 @@ class StackThree(Stack_D0):
             )
 
         return observables
-
-    # ------------------------------------------------------------------
-    # Early-termination hook
-    # ------------------------------------------------------------------
 
     def _fall_off_tracked_objects(self) -> tuple[str, ...]:
         return ("cubeA", "cubeB", "cubeC")

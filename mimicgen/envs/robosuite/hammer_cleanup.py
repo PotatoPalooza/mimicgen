@@ -52,11 +52,7 @@ class HammerCleanup_D0(HammerPlaceEnv, SingleArmEnv_MG):
         fall_off_z_margin: float = 0.1,
         **kwargs,
     ):
-        # Early-termination when the hammer drops below
-        # ``table_offset[2] - fall_off_z_margin`` (table top ~0.90 m in
-        # HammerPlaceEnv's world frame). Gated so BC eval / demo-gen
-        # keep the original no-termination behaviour unless explicitly
-        # opted in via env_kwargs.
+        # Fall-off early-term (gated; BC/demo-gen default off). Threshold = table_offset[2] - fall_off_z_margin.
         self.fall_off_termination = fall_off_termination
         self.fall_off_z_margin = fall_off_z_margin
         self.robot_init_qpos = robot_init_qpos
@@ -66,16 +62,9 @@ class HammerCleanup_D0(HammerPlaceEnv, SingleArmEnv_MG):
         # make sure we don't get a conflict for function implementation
         return SingleArmEnv_MG.edit_model_xml(self, xml_str)
 
-    # ------------------------------------------------------------------
-    # Warp-aware setup
-    # ------------------------------------------------------------------
-
     def _setup_references(self):
         super()._setup_references()
-        # Geom-id caches for warp contact-group queries (`_check_success`
-        # under warp). `check_contact` silently returns False under warp
-        # so the hammer-in-drawer check must route through
-        # `sim.check_contact_groups`.
+        # Geom-id caches for warp check_contact_groups (CPU check_contact no-ops under warp).
         self.drawer_bottom_geom_id = self.sim.model.geom_name2id("CabinetObject_drawer_bottom")
         self.sorting_object_contact_geom_ids = [
             self.sim.model.geom_name2id(g) for g in self.sorting_object.contact_geoms
@@ -229,19 +218,11 @@ class HammerCleanup_D0(HammerPlaceEnv, SingleArmEnv_MG):
         cabinet_closed = self.sim.data.qpos[self.cabinet_qpos_addrs] > -0.01
         return object_in_drawer and cabinet_closed
 
-    # ------------------------------------------------------------------
-    # Early-termination hook
-    # ------------------------------------------------------------------
-
     def _fall_off_tracked_objects(self) -> tuple[str, ...]:
         return ("hammer",)
 
-    def _check_early_termination(self):
-        """Terminate envs where the hammer has dropped below the table top.
-
-        Table top is at ``table_offset[2] = 0.90`` in HammerPlaceEnv's
-        world frame; threshold is ``0.90 - fall_off_z_margin``.
-        """
+    def _check_early_termination(self) -> dict[str, object]:
+        """Hammer-fell-off cause (table_offset[2]=0.90 - fall_off_z_margin)."""
         try:
             extras = super()._check_early_termination()
         except AttributeError:
@@ -432,7 +413,7 @@ class HammerCleanup_D1(HammerCleanup_D0):
         different drawer (cabinet) positions.
 
         Warp branch routes the contact check through
-        ``sim.check_contact_groups`` — ``self.check_contact`` silently
+        ``sim.check_contact_groups`` -- ``self.check_contact`` silently
         returns False under warp, which would make success unreachable.
         """
         if isinstance(self.sim, MjSimWarp):
@@ -679,7 +660,7 @@ class HammerCleanup_D1(HammerCleanup_D0):
         Warp branch: per-env hammer placement via ``sample_batch``, drawer
         stays shared across envs (fixture; D1 drawer bounds sample into a
         wider range, but ``_warp_model`` was snapshotted at XML-load so
-        CPU-side ``sim.model.body_pos`` writes don't propagate — the
+        CPU-side ``sim.model.body_pos`` writes don't propagate -- the
         drawer-randomization is CPU-only behaviour).
         """
         SingleArmEnv._reset_internal(self)
@@ -707,9 +688,7 @@ class HammerCleanup_D1(HammerCleanup_D0):
                     )
                     for obj_pos, obj_quat, obj in placements.values():
                         if obj is self.cabinet_object:
-                            # Fixture — no free joint, and the warp model
-                            # was baked at init, so CPU-side body_pos
-                            # writes would be dead code under warp.
+                            # Fixture: no free joint; warp model baked at init, body_pos writes dead.
                             continue
                         addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
                         start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)

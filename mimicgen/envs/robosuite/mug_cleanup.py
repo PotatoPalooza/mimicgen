@@ -190,9 +190,7 @@ class MugCleanup(SingleArmEnv_MG):
         fall_off_termination: bool = False,
         fall_off_z_margin: float = 0.1,
     ):
-        # Early-termination when the mug drops below
-        # ``table_offset[2] - fall_off_z_margin``. Gated so BC eval /
-        # demo-gen keep the no-termination behaviour by default.
+        # Fall-off early-term (gated; BC/demo-gen default off). Threshold = table_offset[2] - fall_off_z_margin.
         self.fall_off_termination = fall_off_termination
         self.fall_off_z_margin = fall_off_z_margin
 
@@ -246,7 +244,7 @@ class MugCleanup(SingleArmEnv_MG):
         Sparse completion reward.
 
         Scalar float under CPU sims; ``(num_envs,)`` float tensor under
-        warp (matches the Threading pattern — the RSL-RL wrapper treats
+        warp (matches the Threading pattern -- the RSL-RL wrapper treats
         scalars and per-env tensors uniformly).
         """
         success = self._check_success()
@@ -497,7 +495,7 @@ class MugCleanup(SingleArmEnv_MG):
                     )
                     for obj_pos, obj_quat, obj in placements.values():
                         if obj is self.drawer:
-                            # Fixture — warp model was snapshotted at init.
+                            # Fixture -- warp model was snapshotted at init.
                             continue
                         addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
                         start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
@@ -521,9 +519,7 @@ class MugCleanup(SingleArmEnv_MG):
                             obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)])
                         )
 
-        # Drawer joint position: always reset to 0 (closed). Under warp,
-        # scope the write to ``_reset_env_mask`` so kept envs' in-progress
-        # drawer state flows through untouched.
+        # Masked drawer-joint reset to 0 (closed); unmasked rows preserve in-progress drawer state.
         if isinstance(self.sim, MjSimWarp):
             import warp as wp
             qpos_t = wp.to_torch(self.sim._warp_data.qpos)
@@ -704,15 +700,11 @@ class MugCleanup(SingleArmEnv_MG):
 
         return (object_in_drawer and object_upright and drawer_closed)
 
-    # ------------------------------------------------------------------
-    # Early-termination hook
-    # ------------------------------------------------------------------
-
     def _fall_off_tracked_objects(self) -> tuple[str, ...]:
         return ("object",)
 
-    def _check_early_termination(self):
-        """Terminate envs where the cleanup mug has dropped below the table top."""
+    def _check_early_termination(self) -> dict[str, object]:
+        """Mug fall-off cause below table threshold."""
         try:
             extras = super()._check_early_termination()
         except AttributeError:

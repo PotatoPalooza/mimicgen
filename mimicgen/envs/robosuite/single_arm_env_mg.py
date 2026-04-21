@@ -85,21 +85,8 @@ class SingleArmEnv_MG(SingleArmEnv):
 
         return ET.tostring(root, encoding="utf8").decode("utf8")
 
-    def _check_early_termination(self):
-        """
-        Task-specific early-termination hook for failure conditions that should
-        end the episode before the horizon (e.g. an object falling off the
-        table, a robot reaching an invalid configuration). Success is checked
-        separately via ``_check_success``.
-
-        Returns a ``dict[str, bool | np.ndarray | torch.Tensor]`` keyed by
-        cause name (e.g. ``"fell_off_coffee_pod"``). Each value is a per-env
-        bool mask — scalar for single-env sims, ``(num_envs,)`` for warp.
-        An env terminates early if any cause is True. Callers log each
-        cause separately, so adding a new key adds a new metric.
-
-        Default: empty dict (no early termination conditions).
-        """
+    def _check_early_termination(self) -> dict[str, object]:
+        """Early-term causes keyed by name; values are per-env bool masks (scalar CPU, (num_envs,) warp)."""
         return {}
 
     def _check_grasp_tolerant(self, gripper, object_geoms):

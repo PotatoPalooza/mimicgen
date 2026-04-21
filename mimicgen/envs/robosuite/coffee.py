@@ -210,10 +210,8 @@ class Coffee(SingleArmEnv_MG):
         # whether to use ground-truth object states
         self.use_object_obs = use_object_obs
 
-        # Randomization curriculum: difficulty in [0, 1] scales probability of
-        # tipover and bound padding; z_rot bounds linearly interpolate toward
-        # full (-pi, pi) rotation. d=0 reproduces the BC/demo-gen distribution;
-        # d=1 matches the maxed-out "extra randomization" behaviour.
+        # Randomization curriculum: d in [0, 1] scales tipover prob + bound padding
+        # and interpolates z_rot toward full (-pi, pi). d=0 matches BC distribution.
         self._difficulty = float(np.clip(difficulty, 0.0, 1.0))
         self.placement_bounds_pad = placement_bounds_pad
         self.full_rotation_randomization = full_rotation_randomization
@@ -366,7 +364,7 @@ class Coffee(SingleArmEnv_MG):
 
         Called from the RL training loop to ramp the reset distribution
         from BC-matched (d=0) up to full extra randomization (d=1).
-        Takes effect on the next reset — live rollouts are unaffected.
+        Takes effect on the next reset -- live rollouts are unaffected.
         The placement initializer is rebuilt so that each sub-sampler's
         x/y/z_rot ranges reflect the new difficulty (tipover uses the
         live value directly and needs no rebuild).
@@ -554,13 +552,8 @@ class Coffee(SingleArmEnv_MG):
 
                 assert isinstance(self.sim, MjSimWarp)
 
-                # ``_reset_env_mask`` (a bool tensor or index iterable) lets
-                # callers resample only the envs that actually need a fresh
-                # placement. Writes to ``qpos`` are scoped to masked rows via
-                # indexed torch assign — kept envs' object state flows through
-                # untouched. (Passing a full-width ``(num_envs, 7)`` tensor
-                # through ``set_joint_qpos`` would clobber every env, which is
-                # what RobomimicVecEnv's slim reset explicitly avoids.)
+                # Masked per-env placement: unmasked rows kept untouched;
+                # full-width writes via set_joint_qpos would clobber kept envs.
                 mask = getattr(self, "_reset_env_mask", None)
                 if mask is None:
                     sample_idxs_arr = np.arange(self.num_envs)
@@ -598,9 +591,7 @@ class Coffee(SingleArmEnv_MG):
                     obj_pos, obj_quat = self._maybe_tip_placement(obj, obj_pos, obj_quat)
                     self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
-        # Always reset the hinge joint position. Under warp we scope the
-        # write to ``_reset_env_mask`` (if set) so kept envs' lid angle flows
-        # through untouched — ``set_qpos_indexed`` would overwrite all rows.
+        # Masked hinge reset: unmasked rows kept to preserve in-progress lid angles.
         from robosuite.utils.binding_utils import MjSimWarp
 
         if isinstance(self.sim, MjSimWarp):
@@ -875,21 +866,13 @@ class Coffee(SingleArmEnv_MG):
 
         return sensors, names
 
-    # ------------------------------------------------------------------
-    # Sim data helpers — return numpy arrays for both single and warp envs
-    # ------------------------------------------------------------------
-
-    def _get_body_pos(self, body_id):
-        """Return body position: ``(3,)`` numpy for single env, ``(num_envs, 3)`` tensor for warp."""
+    def _get_body_pos(self, body_id: int) -> np.ndarray | torch.Tensor:
+        """Body pos: (3,) numpy CPU / (num_envs, 3) tensor warp."""
         return self.sim.data.body_xpos[body_id]
 
-    def _get_hinge_angle(self):
-        """Return hinge angle: scalar/numpy for single env, ``(num_envs,)`` tensor for warp."""
+    def _get_hinge_angle(self) -> float | np.ndarray | torch.Tensor:
+        """Hinge angle: scalar CPU / (num_envs,) tensor warp."""
         return self.sim.data.qpos[self.hinge_qpos_addr]
-
-    # ------------------------------------------------------------------
-    # Success / metric checks
-    # ------------------------------------------------------------------
 
     def _check_success(self):
         """
@@ -902,15 +885,8 @@ class Coffee(SingleArmEnv_MG):
         """Objects whose body COM z is monitored by the fall-off check."""
         return ("coffee_pod", "coffee_machine")
 
-    def _check_early_termination(self):
-        """Flag envs where any tracked object has dropped below the table.
-
-        Threshold is ``table_offset[2] - fall_off_z_margin``. Adds one
-        ``fell_off_<obj>`` entry per tracked object so each object's
-        fall-off rate shows up as its own telemetry bucket. Gated by
-        ``fall_off_termination`` so BC eval and demo-gen keep the original
-        (no-termination) behaviour unless opted in.
-        """
+    def _check_early_termination(self) -> dict[str, object]:
+        """Adds ``fell_off_<obj>`` cause per tracked object below table threshold; gated by fall_off_termination."""
         extras = super()._check_early_termination()
         if not self.fall_off_termination:
             return extras
@@ -1410,10 +1386,7 @@ class CoffeePreparation(Coffee):
         self.obj_body_id["mug"] = self.sim.model.body_name2id(self.mug.root_body)
         self.drawer_bottom_geom_id = self.sim.model.geom_name2id("CabinetObject_drawer_bottom")
 
-        # Cache geom ids for warp contact-group queries. Required by
-        # _check_mug_placement and the mug-grasp partial metric, both of
-        # which silently no-op under warp when routed through the CPU
-        # check_contact / _check_grasp_tolerant helpers.
+        # Geom-id caches for warp check_contact_groups (CPU check_contact / _check_grasp_tolerant no-op under warp).
         self.coffee_machine_base_geom_id = self.sim.model.geom_name2id("coffee_machine_base_g0")
         self.mug_contact_geom_ids = [
             self.sim.model.geom_name2id(g) for g in self.mug.contact_geoms
@@ -1426,7 +1399,7 @@ class CoffeePreparation(Coffee):
         Warp branch samples placements per-env via ``sample_batch(k)``
         with ``k = |_reset_env_mask|`` and writes only masked qpos rows.
         The drawer is a fixture whose pose is baked into the model at
-        XML-load time — D0/D1/D2 drawer bounds are degenerate single
+        XML-load time -- D0/D1/D2 drawer bounds are degenerate single
         points, so the CPU-side ``sim.model.body_pos`` write is a no-op
         under warp (``_warp_model`` is snapshotted once at init and does
         not re-read from the CPU model).
@@ -1457,11 +1430,7 @@ class CoffeePreparation(Coffee):
                     )
                     for obj_pos, obj_quat, obj in placements.values():
                         if obj is self.cabinet_object:
-                            # Drawer is a fixture — no free joint to write.
-                            # Under warp `_warp_model` was snapshotted at
-                            # init, so even mutating `sim.model.body_pos`
-                            # here would not propagate. D0/D1 drawer bounds
-                            # are single points so this is already correct.
+                            # Fixture: no free joint; _warp_model snapshotted at init so body_pos writes wouldn't propagate.
                             continue
                         obj_pos, obj_quat = self._maybe_tip_placement_batch(obj, obj_pos, obj_quat)
                         addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
@@ -1491,11 +1460,7 @@ class CoffeePreparation(Coffee):
                         obj_pos, obj_quat = self._maybe_tip_placement(obj, obj_pos, obj_quat)
                         self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
-        # Always reset the hinge joint position, and the cabinet slide joint
-        # position. Under warp, scope the write to ``_reset_env_mask`` so
-        # kept envs' drawer state flows through untouched — a full-batch
-        # ``set_qpos_indexed`` would wipe in-progress drawer openings on
-        # every per-env reset.
+        # Masked hinge + drawer-slide reset: unmasked rows kept to preserve in-progress drawer openings.
         if isinstance(self.sim, MjSimWarp):
             import warp as wp
             qpos_t = wp.to_torch(self.sim._warp_data.qpos)
@@ -1536,9 +1501,7 @@ class CoffeePreparation(Coffee):
                     rel_pod_quat = np.asarray(rel_pod_quat, dtype=np.float64)  # (k, 4) wxyz
                     assert pod_obj is self.coffee_pod
 
-                    # Drawer is shared across envs so use env-0's drawer
-                    # bottom geom position; the drawer rotation likewise
-                    # comes from the CPU model copy (identical for all envs).
+                    # Drawer shared across envs; use env-0 geom pos + CPU model quat.
                     drawer_bottom_geom_pos = self.sim.data.geom_xpos[self.drawer_bottom_geom_id][0].cpu().numpy()
                     drawer_rot_mat = T.quat2mat(
                         T.convert_quat(
@@ -1550,9 +1513,7 @@ class CoffeePreparation(Coffee):
                     # Rotate the sampled in-drawer offsets into the world frame.
                     rel_pod_pos[:, :2] = rel_pod_pos[:, :2] @ drawer_rot_mat[:2, :2].T
 
-                    # Per-row quat composition into world frame (same math
-                    # as scalar path — done per-row since there are only k
-                    # of them and this runs once per masked reset).
+                    # Per-row quat composition (k rows only, once per masked reset).
                     pod_quat_batch = np.empty_like(rel_pod_quat)
                     for i in range(k):
                         rel_pod_mat_i = T.quat2mat(T.convert_quat(rel_pod_quat[i], to="xyzw"))
@@ -1700,9 +1661,7 @@ class CoffeePreparation(Coffee):
         # populate with superclass metrics that concern the coffee pod and coffee machine
         metrics = super()._get_partial_task_metrics()
 
-        # whether mug is grasped — under warp the CPU `_check_grasp_tolerant`
-        # path silently returns False on every env, so mirror Coffee's
-        # pod-grasp pattern: both fingerpads must contact the mug's geoms.
+        # Mug grasp via both-fingerpads-contact proxy (CPU _check_grasp_tolerant no-ops under warp).
         if isinstance(self.sim, MjSimWarp):
             left_hit = self.sim.check_contact_groups(
                 self.left_fingerpad_geom_ids, self.mug_contact_geom_ids

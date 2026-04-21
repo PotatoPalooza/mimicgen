@@ -2,6 +2,8 @@
 #
 # Licensed under the NVIDIA Source Code License [see LICENSE for details].
 
+from __future__ import annotations
+
 import numpy as np
 import torch
 from six import with_metaclass
@@ -152,7 +154,7 @@ class Square_D1(Square_D0):
         Modify from superclass to keep sampling nut locations until there's no collision with either peg.
 
         Warp branch samples per-env via ``sample_batch(k)`` and runs peg-
-        overlap rejection vectorised — only still-invalid rows resample
+        overlap rejection vectorised -- only still-invalid rows resample
         each iteration. Writes are scoped to ``_reset_env_mask`` so kept
         envs' nut qpos flows through untouched.
         """
@@ -180,9 +182,7 @@ class Square_D1(Square_D0):
                     peg1_pos_np = self.sim.data.body_xpos[peg1_id].cpu().numpy()[0]  # pegs fixed across envs
                     peg2_pos_np = self.sim.data.body_xpos[peg2_id].cpu().numpy()[0]
 
-                    # Per-env rejection: only resample rows that are still
-                    # invalid. Batch-wide reject-all fails for k>>1 since
-                    # all-envs-valid probability is (1-p)^k.
+                    # Per-env rejection (batch-wide reject fails at k>>1: P(all-valid) = (1-p)^k).
                     pending = np.ones(k, dtype=bool)
                     placements: dict | None = None
                     for _ in range(5000):
