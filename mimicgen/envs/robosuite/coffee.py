@@ -189,14 +189,6 @@ class Coffee(SingleArmEnv_MG):
         renderer_config=None,
         use_warp: bool = False,
         num_envs: int = 1,
-        difficulty: float = 0.0,
-        placement_bounds_pad: float = 0.05,
-        full_rotation_randomization: bool = True,
-        tipover_prob: float = 0.0,
-        tipover_angle_range: tuple[float, float] = (np.pi / 3.0, np.pi / 2.0),
-        tipover_z_bump: float = 0.03,
-        fall_off_termination: bool = False,
-        fall_off_z_margin: float = 0.1,
     ):
         # settings for table top
         self.table_full_size = table_full_size
@@ -209,20 +201,6 @@ class Coffee(SingleArmEnv_MG):
 
         # whether to use ground-truth object states
         self.use_object_obs = use_object_obs
-
-        # Randomization curriculum: d in [0, 1] scales tipover prob + bound padding
-        # and interpolates z_rot toward full (-pi, pi). d=0 matches BC distribution.
-        self._difficulty = float(np.clip(difficulty, 0.0, 1.0))
-        self.placement_bounds_pad = placement_bounds_pad
-        self.full_rotation_randomization = full_rotation_randomization
-        self.tipover_prob = tipover_prob
-        self.tipover_angle_range = tipover_angle_range
-        self.tipover_z_bump = tipover_z_bump
-
-        # Early-termination on tracked objects dropping below
-        # ``table_offset[2] - fall_off_z_margin``. Feeds ``_check_early_termination``.
-        self.fall_off_termination = fall_off_termination
-        self.fall_off_z_margin = fall_off_z_margin
 
         super().__init__(
             robots=robots,
@@ -346,127 +324,8 @@ class Coffee(SingleArmEnv_MG):
             ),
         )
 
-    def _padded_objects(self) -> tuple[str, ...]:
-        return ("coffee_pod", "coffee_machine")
-
-    def _full_rotation_objects(self) -> tuple[str, ...]:
-        return ("coffee_pod",)
-
-    def _tippable_objects(self) -> tuple[str, ...]:
-        return ("coffee_pod",)
-
-    @property
-    def difficulty(self) -> float:
-        return self._difficulty
-
-    def set_difficulty(self, difficulty: float) -> None:
-        """Update the randomization curriculum level.
-
-        Called from the RL training loop to ramp the reset distribution
-        from BC-matched (d=0) up to full extra randomization (d=1).
-        Takes effect on the next reset -- live rollouts are unaffected.
-        The placement initializer is rebuilt so that each sub-sampler's
-        x/y/z_rot ranges reflect the new difficulty (tipover uses the
-        live value directly and needs no rebuild).
-        """
-        self._difficulty = float(np.clip(difficulty, 0.0, 1.0))
-        if getattr(self, "placement_initializer", None) is not None:
-            self._get_placement_initializer()
-
-    def _maybe_apply_extra_randomization(self, bounds: dict[str, dict]) -> dict[str, dict]:
-        d = self._difficulty
-        if d <= 0.0:
-            return bounds
-        pad = self.placement_bounds_pad * d
-        padded = set(self._padded_objects())
-        full_rot = set(self._full_rotation_objects()) if self.full_rotation_randomization else set()
-        out: dict[str, dict] = {}
-        for name, b in bounds.items():
-            nb = dict(b)
-            if name in padded:
-                nb["x"] = (b["x"][0] - pad, b["x"][1] + pad)
-                nb["y"] = (b["y"][0] - pad, b["y"][1] + pad)
-            if name in full_rot:
-                lo, hi = b["z_rot"]
-                nb["z_rot"] = (lo + d * (-np.pi - lo), hi + d * (np.pi - hi))
-            out[name] = nb
-        return out
-
-    def _effective_tipover_prob(self) -> float:
-        return float(self.tipover_prob * self._difficulty)
-
-    def _maybe_tip_placement(
-        self, obj, obj_pos: np.ndarray, obj_quat: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        # quats are (w, x, y, z) to match placement sampler + MuJoCo free-joint qpos order
-        prob = self._effective_tipover_prob()
-        if prob <= 0.0 or obj.name not in self._tippable_objects():
-            return obj_pos, obj_quat
-        if np.random.rand() >= prob:
-            return obj_pos, obj_quat
-
-        tip_angle = np.random.uniform(*self.tipover_angle_range)
-        axis_angle = np.random.uniform(0.0, 2.0 * np.pi)
-        axis = np.array([np.cos(axis_angle), np.sin(axis_angle), 0.0])
-        tip_xyzw = T.axisangle2quat(axis * tip_angle)
-
-        base_xyzw = T.convert_quat(np.asarray(obj_quat), to="xyzw")
-        new_xyzw = T.quat_multiply(tip_xyzw, base_xyzw)
-        new_wxyz = T.convert_quat(new_xyzw, to="wxyz")
-
-        new_pos = np.array(obj_pos, dtype=np.float64)
-        new_pos[2] += self.tipover_z_bump
-        return new_pos, new_wxyz
-
-    def _maybe_tip_placement_batch(
-        self, obj, pos: np.ndarray, quat: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Vectorised variant of :meth:`_maybe_tip_placement` for
-        ``(n, 3)`` ``pos`` + ``(n, 4)`` ``quat`` batches (wxyz). Only the rows
-        that "win" the per-env Bernoulli coin flip get tipped; others pass
-        through unchanged. Returns fresh arrays.
-        """
-        prob = self._effective_tipover_prob()
-        if prob <= 0.0 or obj.name not in self._tippable_objects():
-            return pos, quat
-
-        n = pos.shape[0]
-        tip_mask = np.random.rand(n) < prob
-        k = int(tip_mask.sum())
-        if k == 0:
-            return pos, quat
-
-        tip_angle = np.random.uniform(
-            low=self.tipover_angle_range[0],
-            high=self.tipover_angle_range[1],
-            size=k,
-        )
-        axis_angle = np.random.uniform(0.0, 2.0 * np.pi, size=k)
-        # axisangle2quat(axis * angle) with axis = (cos(a), sin(a), 0) reduces
-        # to tip_xyzw = (cos(a) sin(angle/2), sin(a) sin(angle/2), 0, cos(angle/2)).
-        s = np.sin(tip_angle / 2.0)
-        c = np.cos(tip_angle / 2.0)
-        tip_xyzw = np.stack(
-            [np.cos(axis_angle) * s, np.sin(axis_angle) * s, np.zeros(k), c],
-            axis=-1,
-        )
-
-        base_wxyz = quat[tip_mask]
-        # Convert wxyz -> xyzw: cols (1,2,3,0).
-        base_xyzw = base_wxyz[:, [1, 2, 3, 0]]
-        from robosuite.utils.placement_samplers import _quat_multiply_batch
-
-        new_xyzw = _quat_multiply_batch(tip_xyzw, base_xyzw)
-        new_wxyz = new_xyzw[:, [3, 0, 1, 2]]
-
-        new_quat = quat.copy()
-        new_pos = pos.copy()
-        new_quat[tip_mask] = new_wxyz
-        new_pos[tip_mask, 2] += self.tipover_z_bump
-        return new_pos, new_quat
-
     def _get_placement_initializer(self):
-        bounds = self._maybe_apply_extra_randomization(self._get_initial_placement_bounds())
+        bounds = self._get_initial_placement_bounds()
 
         self.placement_initializer = SequentialCompositeSampler(name="ObjectSampler")
         self.placement_initializer.append_sampler(
@@ -570,7 +429,6 @@ class Coffee(SingleArmEnv_MG):
                         sample_idxs_arr, device=qpos_t.device, dtype=torch.long
                     )
                     for obj_pos, obj_quat, obj in placements.values():
-                        obj_pos, obj_quat = self._maybe_tip_placement_batch(obj, obj_pos, obj_quat)
                         addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
                         start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
                         stacked = np.concatenate(
@@ -588,7 +446,6 @@ class Coffee(SingleArmEnv_MG):
                     from robosuite.utils.binding_utils import MjSimWarp
 
                     assert self.sim is not None and not isinstance(self.sim, MjSimWarp)
-                    obj_pos, obj_quat = self._maybe_tip_placement(obj, obj_pos, obj_quat)
                     self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
         # Masked hinge reset: unmasked rows kept to preserve in-progress lid angles.
@@ -880,21 +737,6 @@ class Coffee(SingleArmEnv_MG):
         """
         metrics = self._get_partial_task_metrics()
         return metrics["task"]
-
-    def _fall_off_tracked_objects(self) -> tuple[str, ...]:
-        """Objects whose body COM z is monitored by the fall-off check."""
-        return ("coffee_pod", "coffee_machine")
-
-    def _check_early_termination(self) -> dict[str, object]:
-        """Adds ``fell_off_<obj>`` cause per tracked object below table threshold; gated by fall_off_termination."""
-        extras = super()._check_early_termination()
-        if not self.fall_off_termination:
-            return extras
-        threshold = float(self.table_offset[2]) - float(self.fall_off_z_margin)
-        for obj_name in self._fall_off_tracked_objects():
-            pos = self._get_body_pos(self.obj_body_id[obj_name])  # (..., 3)
-            extras[f"fell_off_{obj_name}"] = pos[..., 2] < threshold
-        return extras
 
     def _check_lid(self):
         hinge_tolerance = 15.0 * np.pi / 180.0
@@ -1244,18 +1086,6 @@ class CoffeePreparation(Coffee):
         #       and this may break the generate_id_mappings function in task.py
         self.model.merge_objects([self.mug])  # add cleanup object to model
 
-    def _padded_objects(self) -> tuple[str, ...]:
-        return ("mug", "coffee_machine")
-
-    def _full_rotation_objects(self) -> tuple[str, ...]:
-        return ("mug",)
-
-    def _tippable_objects(self) -> tuple[str, ...]:
-        return ("mug",)
-
-    def _fall_off_tracked_objects(self) -> tuple[str, ...]:
-        return ("mug",)
-
     def _get_initial_placement_bounds(self):
         """
         Internal function to get bounds for randomization of initial placements of objects (e.g.
@@ -1308,7 +1138,7 @@ class CoffeePreparation(Coffee):
         )
 
     def _get_placement_initializer(self):
-        bounds = self._maybe_apply_extra_randomization(self._get_initial_placement_bounds())
+        bounds = self._get_initial_placement_bounds()
 
         self.placement_initializer = SequentialCompositeSampler(name="ObjectSampler")
         self.placement_initializer.append_sampler(
@@ -1432,7 +1262,6 @@ class CoffeePreparation(Coffee):
                         if obj is self.cabinet_object:
                             # Fixture: no free joint; _warp_model snapshotted at init so body_pos writes wouldn't propagate.
                             continue
-                        obj_pos, obj_quat = self._maybe_tip_placement_batch(obj, obj_pos, obj_quat)
                         addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
                         start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
                         stacked = np.concatenate(
@@ -1457,7 +1286,6 @@ class CoffeePreparation(Coffee):
                         self.sim.model.body_quat[body_id] = obj_quat
                     else:
                         # object has free joint - use it to set pose
-                        obj_pos, obj_quat = self._maybe_tip_placement(obj, obj_pos, obj_quat)
                         self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
         # Masked hinge + drawer-slide reset: unmasked rows kept to preserve in-progress drawer openings.
