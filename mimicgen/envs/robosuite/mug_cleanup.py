@@ -21,7 +21,7 @@ from copy import deepcopy
 import numpy as np
 import torch
 
-from robosuite.utils.mjcf_utils import CustomMaterial, add_material, find_elements, string_to_array
+from robosuite.utils.mjcf_utils import CustomMaterial, add_material, array_to_string, find_elements, string_to_array
 
 import robosuite.utils.transform_utils as T
 
@@ -354,6 +354,12 @@ class MugCleanup(SingleArmEnv_MG):
             mat_attrib={"texrepeat": "3 3", "specular": "0.4","shininess": "0.1"}
         )
         self.drawer = DrawerObject(name="DrawerObject")
+        # Drawer is a mocap body so per-env randomization flows through
+        # d.mocap_pos under warp (_warp_model.body_pos is shared across
+        # worlds). Slide joint on drawer_link descendant is unaffected.
+        drawer_root = self.drawer.get_obj()
+        drawer_root.set("mocap", "true")
+        drawer_root.set("pos", array_to_string((0.0, 0.3, 0.805)))
         obj_body = self.drawer
         for material in [redwood, ceramic, lightwood]:
             tex_element, mat_element, _, used = add_material(root=obj_body.worldbody,
@@ -455,6 +461,9 @@ class MugCleanup(SingleArmEnv_MG):
         )
         self.drawer_qpos_addr = self.sim.model.get_joint_qpos_addr(self.drawer.joints[0])
         self.drawer_bottom_geom_id = self.sim.model.geom_name2id("DrawerObject_drawer_bottom")
+        drawer_mocap_id = int(self.sim.model.body_mocapid[self.obj_body_id["drawer"]])
+        assert drawer_mocap_id >= 0, "drawer must be mocap"
+        self._drawer_mocap_id = drawer_mocap_id
         # Geom ids used by warp contact-group queries (`_check_success`).
         self.cleanup_object_contact_geom_ids = [
             self.sim.model.geom_name2id(g) for g in self.cleanup_object.contact_geoms
@@ -464,11 +473,9 @@ class MugCleanup(SingleArmEnv_MG):
         """
         Resets simulation internal configurations.
 
-        Warp branch samples per-env mug placement via ``sample_batch(k)``
-        with ``k = |_reset_env_mask|``. Drawer is a fixture whose pose is
-        baked into the model at XML-load time; ``_warp_model`` is
-        snapshotted once at init and does not re-read CPU-model writes,
-        so drawer randomization is effectively CPU-only.
+        Warp branch samples per-env placement via ``sample_batch(k)``. The
+        mug is placed via qpos (free joint); the drawer is placed via
+        per-world ``data.mocap_pos``/``mocap_quat``.
         """
         super()._reset_internal()
 
@@ -490,12 +497,22 @@ class MugCleanup(SingleArmEnv_MG):
                     k = int(sample_idxs_arr.size)
                     placements = self.placement_initializer.sample_batch(k)
                     qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    mocap_pos_t = wp.to_torch(self.sim._warp_data.mocap_pos)
+                    mocap_quat_t = wp.to_torch(self.sim._warp_data.mocap_quat)
                     row_idx = torch.as_tensor(
                         sample_idxs_arr, device=qpos_t.device, dtype=torch.long
                     )
                     for obj_pos, obj_quat, obj in placements.values():
                         if obj is self.drawer:
-                            # Fixture -- warp model was snapshotted at init.
+                            pos_arr = obj_pos.astype(np.float32).copy()
+                            pos_arr[:, 2] = 0.805  # pin z to table top
+                            mocap_pos_t[row_idx, self._drawer_mocap_id] = torch.as_tensor(
+                                pos_arr, device=mocap_pos_t.device, dtype=mocap_pos_t.dtype
+                            )
+                            mocap_quat_t[row_idx, self._drawer_mocap_id] = torch.as_tensor(
+                                obj_quat.astype(np.float32),
+                                device=mocap_quat_t.device, dtype=mocap_quat_t.dtype,
+                            )
                             continue
                         addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
                         start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
@@ -509,11 +526,10 @@ class MugCleanup(SingleArmEnv_MG):
                 object_placements = self.placement_initializer.sample()
                 for obj_pos, obj_quat, obj in object_placements.values():
                     if obj is self.drawer:
-                        body_id = self.sim.model.body_name2id(obj.root_body)
                         obj_pos_to_set = np.array(obj_pos)
-                        obj_pos_to_set[2] = 0.805 # hardcode z-value to make sure it lies on table surface
-                        self.sim.model.body_pos[body_id] = obj_pos_to_set
-                        self.sim.model.body_quat[body_id] = obj_quat
+                        obj_pos_to_set[2] = 0.805  # hardcode z-value to make sure it lies on table surface
+                        self.sim.data.mocap_pos[self._drawer_mocap_id] = obj_pos_to_set
+                        self.sim.data.mocap_quat[self._drawer_mocap_id] = obj_quat
                     else:
                         self.sim.data.set_joint_qpos(
                             obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)])

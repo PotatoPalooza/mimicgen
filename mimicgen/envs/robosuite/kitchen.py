@@ -362,19 +362,29 @@ class Kitchen_D0(KitchenEnv, SingleArmEnv_MG):
 
 class Kitchen_D1(Kitchen_D0):
     """
-    Specify wider distribution for objects including objects that didn't move before. We also had to make some objects 
+    Specify wider distribution for objects including objects that didn't move before. We also had to make some objects
     movable that were fixtures before.
     """
+    def _setup_references(self):
+        super()._setup_references()
+        # Mocap id per fixture; keyed by obj.name to match ``_hardcoded_z_offsets``.
+        self._fixture_mocap_ids = {}
+        for obj in [self.stove_object_1, self.button_object_1, self.serving_region]:
+            bid = self.sim.model.body_name2id(obj.root_body)
+            mid = int(self.sim.model.body_mocapid[bid])
+            assert mid >= 0, f"body {obj.root_body} missing mocap flag"
+            self._fixture_mocap_ids[obj.name] = mid
+
     def _reset_internal(self):
         """
         Update to make sure placement initializer can be used to set poses of objects
         that used to be fixtures before.
 
-        Warp branch: mask-aware ``sample_batch(k)`` for free-joint
-        objects (bread, pot); fixtures (stove, button, serving region)
-        are baked into the model at XML-load time and not re-randomised
-        under warp (``_warp_model`` is a snapshot). Button qpos and
-        stove-state latches are scoped to ``_reset_env_mask``.
+        Warp branch: mask-aware ``sample_batch(k)`` -- free-joint objects
+        (bread, pot) via qpos writes, mocap fixtures (stove, button,
+        serving region) via per-world ``data.mocap_pos``/``mocap_quat``.
+        Button qpos and stove-state latches are scoped to
+        ``_reset_env_mask``.
         """
         SingleArmEnv._reset_internal(self)
 
@@ -396,12 +406,25 @@ class Kitchen_D1(Kitchen_D0):
                     k = int(sample_idxs_arr.size)
                     placements = self.placement_initializer.sample_batch(k)
                     qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    mocap_pos_t = wp.to_torch(self.sim._warp_data.mocap_pos)
+                    mocap_quat_t = wp.to_torch(self.sim._warp_data.mocap_quat)
                     row_idx = torch.as_tensor(
                         sample_idxs_arr, device=qpos_t.device, dtype=torch.long
                     )
                     for obj_pos, obj_quat, obj in placements.values():
                         if obj.name in self._hardcoded_z_offsets:
-                            # Fixture -- no free joint; warp model snapshot.
+                            mid = self._fixture_mocap_ids[obj.name]
+                            pos_arr = obj_pos.astype(np.float32).copy()
+                            # Bottom_site in these XMLs sits at -0.3 m, so the
+                            # sampler's bottom_offset math over-shoots. Pin z.
+                            pos_arr[:, 2] = self._hardcoded_z_offsets[obj.name]
+                            mocap_pos_t[row_idx, mid] = torch.as_tensor(
+                                pos_arr, device=mocap_pos_t.device, dtype=mocap_pos_t.dtype
+                            )
+                            mocap_quat_t[row_idx, mid] = torch.as_tensor(
+                                obj_quat.astype(np.float32),
+                                device=mocap_quat_t.device, dtype=mocap_quat_t.dtype,
+                            )
                             continue
                         addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
                         start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
@@ -416,11 +439,11 @@ class Kitchen_D1(Kitchen_D0):
 
                 for obj_pos, obj_quat, obj in object_placements.values():
                     if obj.name in self._hardcoded_z_offsets:
-                        body_id = self.sim.model.body_name2id(obj.root_body)
+                        mid = self._fixture_mocap_ids[obj.name]
                         obj_pos_to_set = np.array(obj_pos)
                         obj_pos_to_set[2] = self._hardcoded_z_offsets[obj.name]
-                        self.sim.model.body_pos[body_id] = obj_pos_to_set
-                        self.sim.model.body_quat[body_id] = obj_quat
+                        self.sim.data.mocap_pos[mid] = obj_pos_to_set
+                        self.sim.data.mocap_quat[mid] = obj_quat
                     else:
                         self.sim.data.set_joint_qpos(
                             obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)])
@@ -699,34 +722,33 @@ class Kitchen_D1(Kitchen_D0):
             mat_attrib={"texrepeat": "1 1", "specular": "0.4", "shininess": "0.1"},
         )
 
+        # Fixtures are mocap bodies: mujoco-warp's _warp_model.body_pos is
+        # shape (1, nbody, 3) -- shared across worlds -- but d.mocap_pos is
+        # (nworld, nmocap), so per-env randomization flows through mocap.
+        # XML default pos seeds the initial mocap_pos (see mujoco_warp
+        # io.py::make_data); first reset overwrites it.
         self.stove_object_1 = StoveObjectNew(
             name="Stove1",
             joints=None,
         )
-
-        # # old: manually set position in xml and add to mujoco arena
-        # stove_body = self.stove_object_1.get_obj()
-        # stove_body.set("pos", array_to_string((0.23, 0.095, 0.02)))
-        # mujoco_arena.table_body.append(stove_body)
+        stove_body = self.stove_object_1.get_obj()
+        stove_body.set("mocap", "true")
+        stove_body.set("pos", array_to_string((-0.055, 0.1725, 0.895)))
 
         self.button_object_1 = ButtonObjectNew(
             name="Button1",
         )
-
-        # # old: manually set position in xml and add to mujoco arena
-        # button_body = self.button_object_1.get_obj()
-        # button_body.set("quat", array_to_string((0., 0., 0., 1.)))
-        # button_body.set("pos", array_to_string((0.06, 0.10, 0.02)))
-        # mujoco_arena.table_body.append(button_body)
+        button_body = self.button_object_1.get_obj()
+        button_body.set("mocap", "true")
+        button_body.set("quat", array_to_string((0., 0., 0., 1.)))
+        button_body.set("pos", array_to_string((-0.13, 0.125, 0.895)))
 
         self.serving_region = ServingRegionObjectNew(
             name="ServingRegionRed"
         )
-
-        # # old: manually set position in xml and add to mujoco arena
-        # serving_region_object = self.serving_region.get_obj()
-        # serving_region_object.set("pos", array_to_string((0.345, -0.15, 0.003)))
-        # mujoco_arena.table_body.append(serving_region_object)
+        serving_body = self.serving_region.get_obj()
+        serving_body.set("mocap", "true")
+        serving_body.set("pos", array_to_string((0.145, -0.125, 0.878)))
         
         self.pot_object = PotObject(
             name="PotObject",

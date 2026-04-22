@@ -406,6 +406,13 @@ class HammerCleanup_D1(HammerCleanup_D0):
     """
     Move object and drawer with wide initialization. Note we had to make some objects movable that were fixtures before.
     """
+    def _setup_references(self):
+        super()._setup_references()
+        cabinet_body_id = self.sim.model.body_name2id(self.cabinet_object.root_body)
+        mid = int(self.sim.model.body_mocapid[cabinet_body_id])
+        assert mid >= 0, "cabinet_object must be mocap"
+        self._cabinet_mocap_id = mid
+
     def _check_success(self):
         """
         Update from superclass to have a more stringent check that's not buggy
@@ -616,11 +623,13 @@ class HammerCleanup_D1(HammerCleanup_D0):
         self.sorting_object = self._get_sorting_object()
 
         self.cabinet_object = DrawerObject(name="CabinetObject")
-
-        # # old: manually set position in xml and add to mujoco arena
-        # cabinet_object = self.cabinet_object.get_obj()
-        # cabinet_object.set("pos", array_to_string((0.2, 0.30, 0.03)))
-        # mujoco_arena.table_body.append(cabinet_object)
+        # Mocap body: per-env placement flows through d.mocap_pos under
+        # warp (_warp_model.body_pos is shared across worlds). Cabinet's
+        # internal slide joint still works because the mocap constraint
+        # is only on the tagged body itself, not descendants.
+        cabinet_root = self.cabinet_object.get_obj()
+        cabinet_root.set("mocap", "true")
+        cabinet_root.set("pos", array_to_string((0.1, 0.25, 0.905)))
         
         for obj_body in [
                 self.cabinet_object,
@@ -655,13 +664,10 @@ class HammerCleanup_D1(HammerCleanup_D0):
     def _reset_internal(self):
         """
         Update to make sure placement initializer can be used to set drawer (cabinet) pose
-        even though it doesn't have a joint.
+        even though it doesn't have a free joint.
 
-        Warp branch: per-env hammer placement via ``sample_batch``, drawer
-        stays shared across envs (fixture; D1 drawer bounds sample into a
-        wider range, but ``_warp_model`` was snapshotted at XML-load so
-        CPU-side ``sim.model.body_pos`` writes don't propagate -- the
-        drawer-randomization is CPU-only behaviour).
+        Warp branch: per-env hammer placement via ``sample_batch`` (qpos
+        writes), cabinet via per-world ``data.mocap_pos``/``mocap_quat``.
         """
         SingleArmEnv._reset_internal(self)
 
@@ -683,12 +689,22 @@ class HammerCleanup_D1(HammerCleanup_D0):
                     k = int(sample_idxs_arr.size)
                     placements = self.placement_initializer.sample_batch(k)
                     qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    mocap_pos_t = wp.to_torch(self.sim._warp_data.mocap_pos)
+                    mocap_quat_t = wp.to_torch(self.sim._warp_data.mocap_quat)
                     row_idx = torch.as_tensor(
                         sample_idxs_arr, device=qpos_t.device, dtype=torch.long
                     )
                     for obj_pos, obj_quat, obj in placements.values():
                         if obj is self.cabinet_object:
-                            # Fixture: no free joint; warp model baked at init, body_pos writes dead.
+                            pos_arr = obj_pos.astype(np.float32).copy()
+                            pos_arr[:, 2] = 0.905  # pin z to match parent class
+                            mocap_pos_t[row_idx, self._cabinet_mocap_id] = torch.as_tensor(
+                                pos_arr, device=mocap_pos_t.device, dtype=mocap_pos_t.dtype
+                            )
+                            mocap_quat_t[row_idx, self._cabinet_mocap_id] = torch.as_tensor(
+                                obj_quat.astype(np.float32),
+                                device=mocap_quat_t.device, dtype=mocap_quat_t.dtype,
+                            )
                             continue
                         addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
                         start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
@@ -704,12 +720,10 @@ class HammerCleanup_D1(HammerCleanup_D0):
 
                 for obj_pos, obj_quat, obj in object_placements.values():
                     if obj is self.cabinet_object:
-                        # object is fixture - set pose in model
-                        body_id = self.sim.model.body_name2id(obj.root_body)
                         obj_pos_to_set = np.array(obj_pos)
-                        obj_pos_to_set[2] = 0.905 # hardcode z-value to correspond to parent class
-                        self.sim.model.body_pos[body_id] = obj_pos_to_set
-                        self.sim.model.body_quat[body_id] = obj_quat
+                        obj_pos_to_set[2] = 0.905  # hardcode z-value to correspond to parent class
+                        self.sim.data.mocap_pos[self._cabinet_mocap_id] = obj_pos_to_set
+                        self.sim.data.mocap_quat[self._cabinet_mocap_id] = obj_quat
                     else:
                         # object has free joint - use it to set pose
                         self.sim.data.set_joint_qpos(
