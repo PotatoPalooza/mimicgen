@@ -140,7 +140,29 @@ class Kitchen_D0(KitchenEnv, SingleArmEnv_MG):
             self.has_stove_turned_on_with_pot_and_object = False
 
     def _setup_references(self):
+        # task_zoo's KitchenEnv._setup_references writes -0.4 to the button
+        # qpos unconditionally (upstream kitchen.py:379). Under warp that
+        # tiles across all envs; under slim/masked reset it leaks into
+        # unmasked rows whose button state should be preserved. Snapshot
+        # qpos around super() and restore unmasked rows when a mask is
+        # active -- masked rows keep the -0.4 write so Kitchen_D1's own
+        # mask-aware -0.3 write lands correctly.
+        mask = getattr(self, "_reset_env_mask", None)
+        qpos_snap = None
+        if isinstance(self.sim, MjSimWarp) and mask is not None:
+            import warp as wp
+            qpos_snap = wp.to_torch(self.sim._warp_data.qpos).clone()
+
         super()._setup_references()
+
+        if qpos_snap is not None and self.button_qpos_addrs.get(1) is not None:
+            import warp as wp
+            addr = self.button_qpos_addrs[1]
+            m = (mask.to(qpos_snap.device) if isinstance(mask, torch.Tensor)
+                 else torch.as_tensor(np.asarray(mask, dtype=bool), device=qpos_snap.device))
+            qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+            qpos_t[~m, addr] = qpos_snap[~m, addr]
+
         # Geom-id caches for warp contact-group queries.
         self.pot_body_geom_ids = [self.sim.model.geom_name2id("PotObject_body_0")]
         self.stove_burner_geom_ids = [self.sim.model.geom_name2id("Stove1_collision_burner")]
@@ -219,8 +241,55 @@ class Kitchen_D0(KitchenEnv, SingleArmEnv_MG):
         Under warp, scope the button-qpos reset and the stove-state
         latches to ``_reset_env_mask`` so kept envs' in-progress cooking
         state flows through untouched.
+
+        Bypasses ``KitchenEnv._reset_internal`` (which does
+        ``sim.data.set_joint_qpos(...)`` per placed object -- tiles across
+        all envs under warp). Mask-aware ``sample_batch(k)`` path mirrors
+        Kitchen_D1 minus the mocap branch (D0 fixtures are baked into
+        the arena XML, not converted to mocap bodies).
         """
-        KitchenEnv._reset_internal(self)
+        SingleArmEnv._reset_internal(self)
+
+        if not self.deterministic_reset:
+            if isinstance(self.sim, MjSimWarp):
+                import warp as wp
+
+                mask = getattr(self, "_reset_env_mask", None)
+                if mask is None:
+                    sample_idxs_arr = np.arange(self.num_envs)
+                elif isinstance(mask, torch.Tensor):
+                    sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
+                else:
+                    sample_idxs_arr = np.asarray(mask).nonzero()[0]
+
+                if sample_idxs_arr.size > 0:
+                    k = int(sample_idxs_arr.size)
+                    placements = self.placement_initializer.sample_batch(k)
+                    qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    row_idx = torch.as_tensor(
+                        sample_idxs_arr, device=qpos_t.device, dtype=torch.long
+                    )
+                    for obj_pos, obj_quat, obj in placements.values():
+                        addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
+                        start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                        stacked = np.concatenate(
+                            [obj_pos.astype(np.float32), obj_quat.astype(np.float32)], axis=-1
+                        )
+                        qpos_t[row_idx, start:end] = torch.as_tensor(
+                            stacked, device=qpos_t.device, dtype=torch.float32
+                        )
+            else:
+                object_placements = self.placement_initializer.sample()
+                for obj_pos, obj_quat, obj in object_placements.values():
+                    self.sim.data.set_joint_qpos(
+                        obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)])
+                    )
+
+        # ee_force/torque bookkeeping (copied from upstream KitchenEnv._reset_internal).
+        self.ee_force_bias = np.zeros(3)
+        self.ee_torque_bias = np.zeros(3)
+        self._history_force_torque = RingBuffer(dim=6, length=16)
+        self._recent_force_torque = []
 
         mask = getattr(self, "_reset_env_mask", None)
         if isinstance(self.sim, MjSimWarp):
